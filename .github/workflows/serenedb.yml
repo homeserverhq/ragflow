@@ -35,6 +35,7 @@ permissions:
 
 jobs:
   serenedb_go_integration:
+    if: github.event.repository.fork != true
     name: serenedb_go_integration
     runs-on: [ "self-hosted", "ragflow-test" ]
     env:

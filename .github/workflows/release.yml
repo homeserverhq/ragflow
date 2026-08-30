@@ -24,6 +24,7 @@ concurrency:
 
 jobs:
   prepare:
+    if: github.event.repository.fork != true
     runs-on: [ "self-hosted", "ragflow-release" ]
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
@@ -86,6 +87,7 @@ jobs:
           fi
 
   build_cli:
+    if: github.event.repository.fork != true
     needs: prepare
     strategy:
       fail-fast: false
@@ -200,6 +202,7 @@ jobs:
           if-no-files-found: error
 
   publish_cli_assets:
+    if: github.event.repository.fork != true
     needs:
       - prepare
       - build_cli
@@ -253,6 +256,7 @@ jobs:
             tools/scripts/install.ps1
 
   release:
+    if: github.event.repository.fork != true
     needs:
       - prepare
       - publish_cli_assets

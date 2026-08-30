@@ -73,9 +73,10 @@ const ChunkCard = ({
     <Card
       as="article"
       className={classNames(
-        'relative flex-none p-3 pt-6 shadow-none transition-colors',
+        'relative flex-none p-3 pt-6 shadow-none transition-colors cursor-pointer',
         selected && 'bg-text-primary/15',
       )}
+      onClick={handleContentClick}
     >
       <span
         className="
@@ -91,6 +92,7 @@ const ChunkCard = ({
         <Checkbox
           className="mt-1"
           onCheckedChange={handleCheck}
+          onClick={(e) => e.stopPropagation()}
           checked={checked}
         />
 
@@ -124,7 +126,6 @@ const ChunkCard = ({
         <section
           className={cn(styles.content, 'flex-1')}
           onDoubleClick={handleContentDoubleClick}
-          onClick={handleContentClick}
         >
           <div
             dangerouslySetInnerHTML={{
@@ -137,7 +138,7 @@ const ChunkCard = ({
           />
         </section>
 
-        <div>
+        <div onClick={(e) => e.stopPropagation()}>
           <Switch
             checked={enabled}
             onCheckedChange={onChange}

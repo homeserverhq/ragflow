@@ -91,6 +91,7 @@ class DoclingParser(RAGFlowPdfParser):
     def __init__(self, docling_server_url: str = "", request_timeout: int = 600):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.page_images: list[Image.Image] = []
+        self.page_heights: dict[int, float] = {}
         self.page_from = 0
         self.page_to = 10_000
         self.outlines = []
@@ -131,6 +132,26 @@ class DoclingParser(RAGFlowPdfParser):
             self.logger.error(f"[Docling] init DocumentConverter failed: {e}")
             return False
 
+    @staticmethod
+    def _resolve_page_range(page_from: int, page_to: int) -> Optional[tuple[int, int]]:
+        """Translate RAGFlow's task page range into Docling's ``page_range``.
+
+        RAGFlow is 0-based with ``page_to`` exclusive (Python slice stop); Docling
+        is 1-based with both bounds inclusive and rejects a range whose start is
+        below 1 or whose end precedes its start. Bounds are clamped first, since
+        ``parse_pdf`` is public and its callers are not required to pre-clamp.
+
+        Returns ``None`` for a range that covers the whole document, and for an
+        empty one; both mean "convert everything".
+        """
+        start = max(0, page_from)
+        end = min(page_to, MAXIMUM_PAGE_NUMBER)
+        if start == 0 and end >= MAXIMUM_PAGE_NUMBER:
+            return None
+        if end <= start:
+            return None
+        return (start + 1, end)
+
     def __images__(self, fnm, zoomin: int = 1, page_from=0, page_to=MAXIMUM_PAGE_NUMBER, callback=None):
         self.page_from = page_from
         self.page_to = page_to
@@ -154,10 +175,21 @@ class DoclingParser(RAGFlowPdfParser):
         if bbox is None:
             return ""
         x0, x1, top, bott = bbox.x0, bbox.x1, bbox.y0, bbox.y1
-        if hasattr(self, "page_images") and self.page_images and len(self.page_images) >= bbox.page_no:
-            _, page_height = self.page_images[bbox.page_no - 1].size
+        # Docling numbers pages from the start of the document while page_images
+        # only holds the rendered window, and crop() adds page_from back when it
+        # turns a tag into a position. Emit window-relative page numbers, like
+        # cropout_docling_table already indexes by.
+        page_no = bbox.page_no - getattr(self, "page_from", 0)
+        page_height = None
+        if hasattr(self, "page_images") and self.page_images and 0 < page_no <= len(self.page_images):
+            page_height = self.page_images[page_no - 1].size[1]
+        elif getattr(self, "page_heights", None):
+            # Docling reports the page height from the start of the document, so
+            # never offset it: resolve against the absolute page number.
+            page_height = self.page_heights.get(bbox.page_no)
+        if page_height is not None:
             top, bott = page_height - top, page_height - bott
-        return "@@{}\t{:.1f}\t{:.1f}\t{:.1f}\t{:.1f}##".format(bbox.page_no, x0, x1, top, bott)
+        return "@@{}\t{:.1f}\t{:.1f}\t{:.1f}\t{:.1f}##".format(page_no, x0, x1, top, bott)
 
     @staticmethod
     def extract_positions(txt: str) -> list[tuple[list[int], float, float, float, float]]:
@@ -178,9 +210,19 @@ class DoclingParser(RAGFlowPdfParser):
         # page_images empty), and a tag can name a page beyond the rendered range, so
         # indexing page_images below would raise IndexError. mirror
         # cropout_docling_table and the sibling parsers: bail out when there are no
-        # page images and drop positions that fall outside them.
+        # page images and drop positions that fall outside them. When only the
+        # images are missing the positions still flow, so click-to-highlight keeps
+        # working on remote conversions whose page rasterisation failed.
         if not getattr(self, "page_images", None):
-            self.logger.warning("[Docling] crop called without page images; skipping image generation.")
+            self.logger.warning("[Docling] crop called without page images; returning positions only.")
+            if need_position:
+                positions = [
+                    (pns[0] + self.page_from, int(left), int(right), int(top), int(bottom))
+                    for pns, left, right, top, bottom in poss
+                    if pns
+                ]
+                if positions:
+                    return None, positions
             return (None, None) if need_position else None
 
         page_count = len(self.page_images)
@@ -335,6 +377,300 @@ class DoclingParser(RAGFlowPdfParser):
             tables.append(((img, [captions]), positions if positions else ""))
         return tables
 
+    def _set_page_heights(self, doc: dict) -> None:
+        """Record page heights (points) from a converted Docling JSON document.
+
+        Used as a drop-in source of page dimensions when ``page_images`` is
+        unavailable, so position tags can still be emitted with TOP-origin
+        coordinates (the y-flip needs the page height).
+        """
+        self.page_heights = {}
+        pages = doc.get("pages")
+        if not isinstance(pages, dict):
+            return
+        for page_no, page in pages.items():
+            if not isinstance(page, dict):
+                continue
+            size = page.get("size")
+            if not isinstance(size, dict) or size.get("height") is None:
+                continue
+            try:
+                self.page_heights[int(page_no)] = float(size["height"])
+            except (TypeError, ValueError):
+                continue
+
+    @staticmethod
+    def _picture_description_text(pic: dict) -> str:
+        """Extract the vision-model description from a Docling JSON picture item.
+
+        With ``do_picture_description`` enabled, docling-serve records the
+        generated description both on the picture's ``meta.description.text`` and
+        as a ``description`` annotation; prefer the metadata, falling back to the
+        first ``description``-kind annotation. Returns "" when the picture has no
+        description so callers can skip it.
+        """
+        if not isinstance(pic, dict):
+            return ""
+        meta = pic.get("meta")
+        if isinstance(meta, dict):
+            desc = meta.get("description")
+            if isinstance(desc, dict) and isinstance(desc.get("text"), str):
+                text = desc["text"].strip()
+                if text:
+                    return text
+        for annotation in pic.get("annotations") or []:
+            if not isinstance(annotation, dict):
+                continue
+            if annotation.get("kind") not in (None, "description"):
+                continue
+            text = (annotation.get("text") or "").strip()
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _json_bbox(item: dict) -> Optional[_BBox]:
+        """Extract the first ``prov`` bounding box from a Docling JSON item."""
+        prov = item.get("prov")
+        if not isinstance(prov, list) or not prov or not isinstance(prov[0], dict):
+            return None
+        prov_item = prov[0]
+        bb = prov_item.get("bbox")
+        if not isinstance(bb, dict):
+            return None
+        try:
+            coords = [float(bb[k]) for k in ("l", "t", "r", "b")]
+        except (KeyError, TypeError, ValueError):
+            return None
+        page_no = prov_item.get("page_no")
+        if page_no is None:
+            return None
+        try:
+            page_no = int(page_no)
+        except (TypeError, ValueError):
+            return None
+        return _BBox(page_no=page_no, x0=coords[0], y0=coords[1], x1=coords[2], y1=coords[3])
+
+    def _json_to_sections(self, doc: dict, parse_method: str) -> list[tuple[str, ...]]:
+        """Build tagged sections from the ``json_content`` of a remote conversion,
+        mirroring ``_transfer_to_sections`` on the object model.
+
+        When the export carries a ``body`` tree (docling-serve does), its
+        ``children`` is the authoritative reading order and sections follow it.
+        Otherwise the flat ``texts`` list is used, in array order. Figure
+        descriptions are NOT emitted here: they ride inside the figure's chunk,
+        paired with its caption by ``_json_to_tables``.
+        """
+        sections: list[tuple[str, ...]] = []
+        body = doc.get("body")
+        if isinstance(body, dict):
+            children = body.get("children")
+            if isinstance(children, list) and children:
+                self._json_walk_children(doc, children, sections, parse_method)
+                return sections
+
+        texts = doc.get("texts")
+        if isinstance(texts, list):
+            for item in texts:
+                if not isinstance(item, dict):
+                    continue
+                self._json_append_text_section(item, sections, parse_method)
+        return sections
+
+    def _json_walk_children(
+        self,
+        doc: dict,
+        children: list,
+        sections: list[tuple[str, ...]],
+        parse_method: str,
+    ) -> None:
+        """Emit snippets in the order Docling's ``body.children`` tree lists them:
+        body text/formulas via the text filter, and picture descriptions at the
+        picture's own position. Tables and key-value items are handled separately
+        by ``_json_to_tables``."""
+        for child in children:
+            if not isinstance(child, dict):
+                continue
+            ref = child.get("$ref")
+            if not isinstance(ref, str) or not ref.startswith("#/"):
+                continue
+            parts = ref.split("/")
+            if len(parts) != 3:
+                continue
+            kind, index_str = parts[1], parts[2]
+            try:
+                index = int(index_str)
+            except (TypeError, ValueError):
+                continue
+            if kind == "texts":
+                texts = doc.get("texts")
+                if isinstance(texts, list) and index < len(texts) and isinstance(texts[index], dict):
+                    self._json_append_text_section(texts[index], sections, parse_method)
+            elif kind == "groups":
+                group = None
+                groups = doc.get("groups")
+                if isinstance(groups, list) and index < len(groups):
+                    group = groups[index]
+                elif isinstance(groups, dict):
+                    group = groups.get(index_str)
+                if isinstance(group, dict) and isinstance(group.get("children"), list):
+                    self._json_walk_children(doc, group["children"], sections, parse_method)
+
+    def _json_append_text_section(
+        self,
+        item: dict,
+        sections: list[tuple[str, ...]],
+        parse_method: str,
+    ) -> None:
+        """Append a single body text/formula item, honouring the same label filter
+        used before the body-tree ordering existed."""
+        label = (item.get("label") or "").strip()
+        typ = None
+        payload = None
+        if label == "formula":
+            typ = DoclingContentType.EQUATION.value
+            payload = (item.get("text") or item.get("orig") or "").strip()
+        elif label == "list_item":
+            typ = DoclingContentType.TEXT.value
+            payload = (item.get("text") or "").strip()
+        elif label in ("section_header", "text"):
+            parent = item.get("parent")
+            ref = parent.get("$ref") if isinstance(parent, dict) else ""
+            if ref == "#/body":
+                typ = DoclingContentType.TEXT.value
+                payload = (item.get("text") or "").strip()
+        if typ is None or not payload:
+            return
+        bbox = self._json_bbox(item)
+        tag = self._make_line_tag(bbox) if isinstance(bbox, _BBox) else ""
+        self._append_json_section(sections, payload, typ, tag, parse_method)
+
+    @staticmethod
+    def _append_json_section(
+        sections: list[tuple[str, ...]],
+        payload: str,
+        typ: str,
+        tag: str,
+        parse_method: str,
+    ) -> None:
+        """Append a section in the tuple shape dictated by ``parse_method``."""
+        if parse_method in {"manual", "pipeline"}:
+            sections.append((payload, typ, tag))
+        elif parse_method == "paper":
+            sections.append((payload + tag, typ))
+        else:
+            sections.append((payload, tag))
+
+    @staticmethod
+    def _table_html_from_json(tab: dict) -> str:
+        """Rebuild the table markup from ``data.table_cells`` (row/col offsets).
+
+        This server's JSON export carries no ``table_html``/``text`` fields, only
+        per-cell text with offset bounds, so the HTML is synthesised from those.
+        Rows/columns larger than any cell's bounds are dropped.
+        """
+        data = tab.get("data")
+        if not isinstance(data, dict):
+            return ""
+        cells = data.get("table_cells")
+        if not isinstance(cells, list):
+            return ""
+        specs = []
+        max_row = 0
+        max_col = 0
+        for c in cells:
+            if not isinstance(c, dict) or not isinstance(c.get("text"), str):
+                continue
+            try:
+                r0 = int(c.get("start_row_offset_idx") or 0)
+                c0 = int(c.get("start_col_offset_idx") or 0)
+                r1 = max(int(c.get("end_row_offset_idx") or (r0 + 1)), r0 + 1)
+                c1 = max(int(c.get("end_col_offset_idx") or (c0 + 1)), c0 + 1)
+            except (TypeError, ValueError):
+                continue
+            max_row = max(max_row, r1)
+            max_col = max(max_col, c1)
+            specs.append({
+                "r0": r0, "c0": c0, "rowspan": r1 - r0, "colspan": c1 - c0,
+                "text": c.get("text"), "header": bool(c.get("column_header")),
+            })
+        if not specs or max_row <= 0 or max_col <= 0:
+            return ""
+        anchor = {(s["r0"], s["c0"]): s for s in specs}
+        out = ["<table>"]
+        for r in range(max_row):
+            row_cells = []
+            c = 0
+            while c < max_col:
+                spec = anchor.get((r, c))
+                if spec is None:
+                    c += 1
+                    continue
+                tag = "th" if spec["header"] else "td"
+                attrs = ""
+                if spec["rowspan"] > 1:
+                    attrs += f' rowspan="{spec["rowspan"]}"'
+                if spec["colspan"] > 1:
+                    attrs += f' colspan="{spec["colspan"]}"'
+                row_cells.append(f"<{tag}{attrs}>{spec['text']}</{tag}>")
+                c += spec["colspan"] if spec["colspan"] > 0 else 1
+            out.append("<tr>" + "".join(row_cells) + "</tr>")
+        out.append("</table>")
+        return "".join(out)
+
+    def _json_to_tables(self, doc: dict):
+        """Mirror ``_transfer_to_tables`` on a converted Docling JSON document."""
+        tables = []
+        ref_to_text = {}
+        texts = doc.get("texts")
+        if isinstance(texts, list):
+            for item in texts:
+                if isinstance(item, dict) and item.get("self_ref"):
+                    ref_to_text[item["self_ref"]] = (item.get("text") or "").strip()
+
+        for tab in doc.get("tables") or []:
+            if not isinstance(tab, dict):
+                continue
+            img = None
+            positions = ""
+            bbox = self._json_bbox(tab)
+            if bbox:
+                img, positions = self.cropout_docling_table(bbox.page_no, (bbox.x0, bbox.y0, bbox.x1, bbox.y1))
+                if not positions and bbox.page_no in self.page_heights:
+                    height = self.page_heights[bbox.page_no]
+                    x0, y0 = int(bbox.x0), int(height - bbox.y0)
+                    x1, y1 = int(bbox.x1), int(height - bbox.y1)
+                    positions = [(bbox.page_no - 1, x0, x1, y0, y1)]
+            html = self._table_html_from_json(tab)
+            if not html:
+                html = (tab.get("text") or "").strip()
+            tables.append(((img, html), positions if positions else ""))
+
+        for pic in doc.get("pictures") or []:
+            if not isinstance(pic, dict):
+                continue
+            img = None
+            positions = ""
+            bbox = self._json_bbox(pic)
+            if bbox:
+                img, positions = self.cropout_docling_table(bbox.page_no, (bbox.x0, bbox.y0, bbox.x1, bbox.y1))
+                if not positions and bbox.page_no in self.page_heights:
+                    height = self.page_heights[bbox.page_no]
+                    x0, y0 = int(bbox.x0), int(height - bbox.y0)
+                    x1, y1 = int(bbox.x1), int(height - bbox.y1)
+                    positions = [(bbox.page_no - 1, x0, x1, y0, y1)]
+            captions = []
+            for cap in pic.get("captions") or []:
+                ref = cap.get("$ref") if isinstance(cap, dict) else ""
+                caption = ref_to_text.get(ref, "")
+                if caption:
+                    captions.append(caption)
+            description = self._picture_description_text(pic)
+            if description:
+                captions.append(description)
+            tables.append(((img, captions), positions if positions else ""))
+        return tables
+
     @staticmethod
     def _sections_from_remote_text(text: str, parse_method: str) -> list[tuple[str, ...]]:
         txt = (text or "").strip()
@@ -396,6 +732,7 @@ class DoclingParser(RAGFlowPdfParser):
         parse_method: str = "raw",
         docling_server_url: Optional[str] = None,
         request_timeout: Optional[int] = None,
+        page_range: Optional[tuple[int, int]] = None,
     ):
         """
         Parses a PDF document using a remote Docling server.
@@ -431,21 +768,57 @@ class DoclingParser(RAGFlowPdfParser):
         filename = Path(filepath).name or "input.pdf"
         b64 = base64.b64encode(pdf_bytes).decode("ascii")
 
+        # docling-serve's ConvertDocumentsOptions.page_range is Docling's own field
+        # (docling.datamodel.service.options): 1-based, both bounds inclusive.
+        # Docling still numbers the pages it returns from the start of the
+        # document, so nothing downstream needs rebasing. A task covering the
+        # whole document omits the field entirely.
+        range_opt = {"page_range": list(page_range)} if page_range else {}
+
+        # Shared conversion options. image_export_mode is "placeholder" so page
+        # images are emitted as <!-- image --> markers instead of inline base64
+        # data URIs: binary image payloads must never reach the embedding model
+        # as supposedly-"textual" content. do_ocr enables OCR of scanned pages.
+        base_opts = {
+            "from_formats": ["pdf"],
+            "to_formats": ["json", "md", "text"],
+            "image_export_mode": "placeholder",
+            "do_ocr": True,
+            **range_opt,
+        }
+
+        # Picture description: replace every image with a description produced by
+        # the preset's vision model (external_vlm, by default). Only sent when the
+        # switch is on, so an older docling-serve deployment that drops unknown
+        # options sees no change. The server emits the same value it needs to
+        # include, so images are never sent as base64 to the embedding model.
+        if os.environ.get("DOCLING_PICTURE_DESCRIPTION", "0").strip().lower() in ("1", "true", "yes", "on"):
+            picture_opts = {
+                "do_picture_description": True,
+                "picture_description_preset": os.environ.get("DOCLING_PICTURE_DESCRIPTION_PRESET", "external_vlm").strip() or "external_vlm",
+                "picture_description_area_threshold": float(os.environ.get("DOCLING_PICTURE_DESCRIPTION_AREA_THRESHOLD", "0.01") or 0.01),
+            }
+            base_opts.update(picture_opts)
+            self.logger.info(
+                f"[Docling] Picture description enabled via preset "
+                f"{picture_opts['picture_description_preset']} "
+                f"(area_threshold={picture_opts['picture_description_area_threshold']})."
+            )
+
         # Standard payloads
         # Standard fallback payloads (no chunking)
         v1_payload_standard = {
-            "options": {"from_formats": ["pdf"], "to_formats": ["json", "md", "text"]},
+            "options": dict(base_opts),
             "sources": [{"kind": "file", "filename": filename, "base64_string": b64}],
         }
         v1alpha_payload_standard = {
-            "options": {"from_formats": ["pdf"], "to_formats": ["json", "md", "text"]},
+            "options": dict(base_opts),
             "file_sources": [{"filename": filename, "base64_string": b64}],
         }
 
         # --- NEW: Correct API Contract for Chunking ---
         chunking_opts = {
-            "from_formats": ["pdf"],
-            "to_formats": ["json", "md", "text"],
+            **base_opts,
             "do_chunking": True,
             "chunking_options": {
                 "max_tokens": 512,
@@ -539,6 +912,21 @@ class DoclingParser(RAGFlowPdfParser):
             raise RuntimeError("[Docling] remote response does not contain parsed documents.")
 
         for doc in docs:
+            json_content = doc.get("json_content")
+            if isinstance(json_content, dict):
+                # Prefer the JSON export: it carries per-item page/bbox geometry,
+                # which is what powers click-to-highlight and chunk preview images
+                # (tags + page_images). Fall back to the flat markdown/text export
+                # for servers that return a JSON-less document.
+                self._set_page_heights(json_content)
+                json_sections = self._json_to_sections(json_content, parse_method=parse_method)
+                if json_sections:
+                    sections.extend(json_sections)
+                    json_tables = self._json_to_tables(json_content)
+                    if json_tables:
+                        tables.extend(json_tables)
+                    continue
+
             md = doc.get("md_content")
             txt = doc.get("text_content")
             if isinstance(md, str) and md.strip():
@@ -546,14 +934,8 @@ class DoclingParser(RAGFlowPdfParser):
             elif isinstance(txt, str) and txt.strip():
                 sections.extend(self._sections_from_remote_text(txt, parse_method=parse_method))
 
-            json_content = doc.get("json_content")
-            if isinstance(json_content, dict):
-                md_fallback = json_content.get("md_content")
-                if isinstance(md_fallback, str) and md_fallback.strip() and not sections:
-                    sections.extend(self._sections_from_remote_text(md_fallback, parse_method=parse_method))
-
         if callback:
-            callback(0.95, f"[Docling] Remote sections: {len(sections)}")
+            callback(0.95, f"[Docling] Remote sections: {len(sections)}, tables: {len(tables)}")
         return sections, tables
 
     def parse_pdf(
@@ -569,14 +951,36 @@ class DoclingParser(RAGFlowPdfParser):
         parse_method: str = "raw",
         docling_server_url: Optional[str] = None,
         request_timeout: Optional[int] = None,
+        page_from: int = 0,
+        page_to: int = MAXIMUM_PAGE_NUMBER,
     ):
         self.outlines = extract_pdf_outlines(binary if binary is not None else filepath)
 
         if not self.check_installation(docling_server_url=docling_server_url):
             raise RuntimeError("Docling not available, please install `docling`")
 
+        # RAGFlow splits a large PDF into several page-range tasks and calls this
+        # once per range. Without forwarding the range every task converts the
+        # whole document, so the work is repeated N times and each request is as
+        # slow and as memory-hungry as the entire file.
+        page_range = self._resolve_page_range(page_from, page_to)
+        if page_range:
+            self.logger.info(f"[Docling] resolved page range {page_range} (from page_from={page_from} page_to={page_to})")
+
         server_url = self._effective_server_url(docling_server_url)
         if server_url:
+            # Render the task's page window so the shared crop()/cropout_docling_table
+            # machinery can attach chunk preview images and highlight rects, mirroring
+            # the local docling and deepdoc paths. Previews are rasterised locally
+            # (pdfplumber) from the PDF, never fetched from the server, so the
+            # image_export_mode setting has no bearing on them.
+            try:
+                if page_range:
+                    self.__images__(binary if binary is not None else filepath, zoomin=1, page_from=page_range[0] - 1, page_to=page_range[1])
+                else:
+                    self.__images__(binary if binary is not None else filepath, zoomin=1)
+            except Exception as e:
+                self.logger.warning(f"[Docling] render pages failed: {e}")
             return self._parse_pdf_remote(
                 filepath=filepath,
                 binary=binary,
@@ -584,6 +988,7 @@ class DoclingParser(RAGFlowPdfParser):
                 parse_method=parse_method,
                 docling_server_url=server_url,
                 request_timeout=request_timeout,
+                page_range=page_range,
             )
 
         if binary is not None:
@@ -606,7 +1011,13 @@ class DoclingParser(RAGFlowPdfParser):
             callback(0.1, f"[Docling] Converting: {src_path}")
 
         try:
-            self.__images__(str(src_path), zoomin=1)
+            # Render the same window the conversion covers, so a page-split task
+            # does not pay the whole document's rasterisation cost, and so
+            # page_from matches the images the position logic indexes into.
+            if page_range:
+                self.__images__(str(src_path), zoomin=1, page_from=page_range[0] - 1, page_to=page_range[1])
+            else:
+                self.__images__(str(src_path), zoomin=1)
         except Exception as e:
             self.logger.warning(f"[Docling] render pages failed: {e}")
 
@@ -615,7 +1026,7 @@ class DoclingParser(RAGFlowPdfParser):
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_formula_enrichment = do_formula_enrichment
         conv = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)})
-        conv_res = conv.convert(str(src_path))
+        conv_res = conv.convert(str(src_path), page_range=page_range) if page_range else conv.convert(str(src_path))
         doc = conv_res.document
         if callback:
             callback(0.7, f"[Docling] Parsed doc: {getattr(doc, 'num_pages', 'n/a')} pages")

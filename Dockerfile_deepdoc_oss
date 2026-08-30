@@ -58,6 +58,8 @@ COPY deepdoc/server/deepdoc_server.py       /app/deepdoc/server/
 COPY deepdoc/server/endpoints/           /app/deepdoc/server/endpoints/
 COPY deepdoc/server/adapters/            /app/deepdoc/server/adapters/
 
+ENV PYTHONPATH="/app:/app/deepdoc"
+
 EXPOSE 9390
 
 HEALTHCHECK --interval=10s --timeout=10s --retries=5 \

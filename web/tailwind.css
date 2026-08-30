@@ -106,6 +106,8 @@
     /* --state-warning: #767573; */
     --state-warning: 250 173 20;
     --state-error: 216 73 75;
+    /* PDF chunk highlight overlay color */
+    --highlight-yellow: 255 255 0;
 
     --team-group: #5ab77e;
     --team-member: #5c96c8;

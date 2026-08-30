@@ -62,13 +62,18 @@ const ChunkCard = ({
   const [open, setOpen] = useState<boolean>(false);
   return (
     <Card
-      className={classNames('rounded-lg w-full py-3 px-3', {
+      className={classNames('rounded-lg w-full py-3 px-3 cursor-pointer', {
         'bg-bg-title': selected,
         'bg-bg-input': !selected,
       })}
+      onClick={handleContentClick}
     >
       <div className="flex items-start justify-between gap-2">
-        <Checkbox onCheckedChange={handleCheck} checked={checked}></Checkbox>
+        <Checkbox
+          onCheckedChange={handleCheck}
+          onClick={(e) => e.stopPropagation()}
+          checked={checked}
+        ></Checkbox>
         {item.image_id && (
           <Popover open={open}>
             <PopoverTrigger
@@ -97,7 +102,6 @@ const ChunkCard = ({
         )}
         <section
           onDoubleClick={handleContentDoubleClick}
-          onClick={handleContentClick}
           className={styles.content}
         >
           <div
@@ -109,7 +113,7 @@ const ChunkCard = ({
             })}
           ></div>
         </section>
-        <div>
+        <div onClick={(e) => e.stopPropagation()}>
           <Switch
             checked={enabled}
             onCheckedChange={onChange}

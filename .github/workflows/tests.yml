@@ -33,7 +33,7 @@ jobs:
     name: ragflow_preflight
     # https://docs.github.com/en/actions/using-jobs/using-conditions-to-control-job-execution
     # https://github.com/orgs/community/discussions/26261
-    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'ci') && (github.event.action != 'labeled' || github.event.label.name == 'ci')) }}
+    if: ${{ github.event.repository.fork != true && (github.event_name != 'pull_request' || (github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'ci') && (github.event.action != 'labeled' || github.event.label.name == 'ci'))) }}
     runs-on: [ "self-hosted", "ragflow-test" ]
     outputs:
       http_api_test_level: ${{ steps.test_level.outputs.http_api_test_level }}
@@ -148,7 +148,7 @@ jobs:
   ragflow_tests_infinity:
     name: ragflow_tests_infinity
     needs: ragflow_preflight
-    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'ci') && (github.event.action != 'labeled' || github.event.label.name == 'ci')) }}
+    if: ${{ github.event.repository.fork != true && (github.event_name != 'pull_request' || (github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'ci') && (github.event.action != 'labeled' || github.event.label.name == 'ci'))) }}
     runs-on: [ "self-hosted", "ragflow-test" ]
     env:
       DOC_ENGINE: infinity
@@ -630,7 +630,7 @@ jobs:
   ragflow_tests_elasticsearch:
     name: ragflow_tests_elasticsearch
     needs: ragflow_preflight
-    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'ci') && (github.event.action != 'labeled' || github.event.label.name == 'ci')) }}
+    if: ${{ github.event.repository.fork != true && (github.event_name != 'pull_request' || (github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'ci') && (github.event.action != 'labeled' || github.event.label.name == 'ci'))) }}
     runs-on: [ "self-hosted", "ragflow-test" ]
     env:
       DOC_ENGINE: elasticsearch
