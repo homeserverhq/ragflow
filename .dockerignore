@@ -33,11 +33,13 @@ internal/binding/cpp/cmake-build-debug/
 target/
 
 # ── ragflow_deps build context (built as a separate image, mounted ──
-# ── from infiniflow/ragflow_deps:latest by the main Dockerfile)     ──
+# ── from the pinned ragflow_deps:latest-python image)               ──
 # Excluding the directory contents keeps the main build context small
 # regardless of which deps files download_deps.py currently fetches.
 # The deps image is built from this directory with:
-#   cd ragflow_deps && docker build -f Dockerfile -t infiniflow/ragflow_deps .
+#   cd ragflow_deps && docker build -f Dockerfile -t infiniflow/ragflow_deps:latest-python .
+# To use a locally built image instead of the pinned digest, pass
+#   --build-arg RAGFLOW_DEPS_IMAGE=infiniflow/ragflow_deps:latest-python
 # The two ORT version-pin files are re-included: build.sh's
 # check_ort_version_consistency (run by Dockerfile_go's `--go` build) greps
 # them. Re-including requires NOT excluding the directory itself.

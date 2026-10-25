@@ -39,9 +39,9 @@ This image is approximately 2 GB in size and relies on external LLM and embeddin
 git clone https://github.com/infiniflow/ragflow.git
 cd ragflow/ragflow_deps
 uv run python3 download_deps.py
-docker build -f Dockerfile -t infiniflow/ragflow_deps .
+docker build -f Dockerfile -t infiniflow/ragflow_deps:latest-python .
 cd ..
-docker build -f Dockerfile -t infiniflow/ragflow:nightly .
+docker build --build-arg RAGFLOW_DEPS_IMAGE=infiniflow/ragflow_deps:latest-python -f Dockerfile -t infiniflow/ragflow:nightly .
 ```
 
 ## Launch a RAGFlow Service from Docker for macOS

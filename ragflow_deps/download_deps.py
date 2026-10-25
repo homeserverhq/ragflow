@@ -24,11 +24,13 @@
 #
 #   uv run python3 ragflow_deps/download_deps.py            # download
 #   cd ragflow_deps
-#   docker build -f Dockerfile -t infiniflow/ragflow_deps .
+#   docker build -f Dockerfile -t infiniflow/ragflow_deps:latest-python .
 #
-# The main `Dockerfile` (built from the project root) pulls this image
-# via `--mount=type=bind,from=infiniflow/ragflow_deps:latest,...` and
-# is unaffected by where these files live locally.
+# The main `Dockerfile` (built from the project root) mounts the pinned
+# `infiniflow/ragflow_deps:latest-python` image through a `ragflow_deps`
+# stage alias. Pass
+#   --build-arg RAGFLOW_DEPS_IMAGE=infiniflow/ragflow_deps:latest-python
+# to use a locally built image instead.
 
 import argparse
 import hashlib
