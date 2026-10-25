@@ -19,6 +19,7 @@ from abc import ABC
 import asyncio
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 from agent.tools.base import ToolMeta, ToolParamBase, ToolBase
+from common.browser_utils import ensure_crawl4ai_uses_system_chromium
 from common.connection_utils import timeout
 
 
@@ -99,6 +100,7 @@ class Crawler(ToolBase, ABC):
             return
 
         proxy = self._param.proxy if self._param.proxy else None
+        ensure_crawl4ai_uses_system_chromium()
 
         browser_config = BrowserConfig(
             verbose=True,

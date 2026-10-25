@@ -36,6 +36,7 @@ from api.db.services import duplicate_name
 from api.db.services.file_service import FileService
 from api.utils.file_utils import filename_type
 from common import settings
+from common.browser_utils import resolve_chromium_binary
 from common.connection_utils import timeout
 from common.misc_utils import get_uuid
 from rag.llm import FACTORY_DEFAULT_BASE_URL
@@ -391,23 +392,7 @@ class Browser(ComponentBase, ABC):
         for explicit in explicit_candidates:
             if explicit and os.path.isfile(explicit) and os.access(explicit, os.X_OK):
                 return explicit
-        candidates = [
-            "/opt/chrome/chrome",
-            "/usr/local/bin/chrome",
-            "/usr/local/bin/google-chrome",
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable",
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
-        ]
-        for path in candidates:
-            if os.path.isfile(path) and os.access(path, os.X_OK):
-                return path
-        for cmd in ("chrome", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
-            path = shutil.which(cmd)
-            if path and os.path.isfile(path) and os.access(path, os.X_OK):
-                return path
-        return ""
+        return resolve_chromium_binary()
 
     @staticmethod
     def _normalize_model_name(model: Any) -> str:
@@ -529,6 +514,10 @@ class Browser(ComponentBase, ABC):
             "llm": llm,
             "available_file_paths": available_file_paths,
         }
+        executable_path = self._resolve_browser_executable()
+        if not executable_path:
+            raise RuntimeError("No Chromium executable found. Install chromium or set BROWSER_USE_EXECUTABLE_PATH; refusing to let browser-use download Chrome for Testing at runtime.")
+
         browser_obj = None
         previous_disable_extensions = os.environ.get("BROWSER_USE_DISABLE_EXTENSIONS")
         previous_browser_binary_path = os.environ.get("BROWSER_USE_BROWSER_BINARY_PATH")
@@ -540,7 +529,6 @@ class Browser(ComponentBase, ABC):
             else:
                 os.environ.pop("BROWSER_USE_DISABLE_EXTENSIONS", None)
 
-            executable_path = self._resolve_browser_executable()
             browser_kwargs = {
                 "headless": self._param.headless,
                 "downloads_path": download_dir,
@@ -549,13 +537,10 @@ class Browser(ComponentBase, ABC):
                 # Disable runtime extension download by default for intranet/offline environments.
                 # Enable only when explicitly required and extensions are pre-cached.
                 "enable_default_extensions": enable_default_extensions,
+                "executable_path": executable_path,
             }
-            if executable_path:
-                browser_kwargs["executable_path"] = executable_path
-                # Keep browser-use watchdog fallback in sync with our resolved path.
-                os.environ["BROWSER_USE_BROWSER_BINARY_PATH"] = executable_path
-            else:
-                logging.warning("Browser no local browser executable found. Set BROWSER_USE_EXECUTABLE_PATH or preinstall chromium in image to avoid runtime playwright install.")
+            # Keep browser-use watchdog fallback in sync with our resolved path.
+            os.environ["BROWSER_USE_BROWSER_BINARY_PATH"] = executable_path
             if profile_dir:
                 browser_kwargs["user_data_dir"] = profile_dir
                 # browser-use expects profile_directory to be a profile name
@@ -565,7 +550,8 @@ class Browser(ComponentBase, ABC):
             browser_obj = BrowserUseBrowser(**browser_kwargs)
             agent_kwargs["browser"] = browser_obj
         except (OSError, RuntimeError, TypeError, ValueError) as e:
-            logging.warning("Browser browser context customization skipped: %s", e)
+            logging.error("Browser browser context setup failed: %s", e)
+            raise
 
         agent = BrowserUseAgent(**agent_kwargs)
 

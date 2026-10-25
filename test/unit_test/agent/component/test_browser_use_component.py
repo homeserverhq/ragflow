@@ -14,12 +14,15 @@
 #  limitations under the License.
 #
 
+import asyncio
 import re
 import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse
+
+import pytest
 
 from api.db import FileType
 
@@ -97,6 +100,15 @@ def _build_component():
     component._canvas = _FakeCanvas()
     component._param = SimpleNamespace(upload_sources="")
     return component
+
+
+def test_run_browser_use_requires_system_chromium(monkeypatch):
+    component = _build_component()
+    monkeypatch.setattr(component, "_build_browser_llm", lambda: object())
+    monkeypatch.setattr(component, "_resolve_browser_executable", lambda: "")
+
+    with pytest.raises(RuntimeError, match="No Chromium executable found"):
+        asyncio.run(component._run_browser_use_async("test task", "/tmp"))
 
 
 def test_prepare_input_values_records_variable_inputs():

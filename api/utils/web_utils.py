@@ -25,6 +25,7 @@ import aiosmtplib
 from email.mime.text import MIMEText
 from email.header import Header
 from common import settings
+from common.browser_utils import resolve_chromedriver, resolve_chromium_binary
 from quart import render_template_string
 from api.utils.email_templates import EMAIL_TEMPLATES
 from selenium import webdriver
@@ -34,7 +35,6 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.expected_conditions import staleness_of
 from selenium.webdriver.support.ui import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
 
 
 OTP_LENGTH = 4
@@ -88,44 +88,50 @@ def apply_safe_file_response_headers(response, content_type: str | None, ext: st
 def html2pdf(
     source: str,
     timeout: int = 2,
-    install_driver: bool = True,
     print_options: dict = {},
 ):
     with browser_fetch_slot():
-        result = __get_pdf_from_html(source, timeout, install_driver, print_options)
+        result = __get_pdf_from_html(source, timeout, print_options)
     return result
 
 
 def __send_devtools(driver, cmd, params={}):
-    resource = "/session/%s/chromium/send_command_and_get_result" % driver.session_id
-    url = driver.command_executor._url + resource
-    body = json.dumps({"cmd": cmd, "params": params})
-    response = driver.command_executor._request("POST", url, body)
-
-    if not response:
-        raise Exception(response.get("value"))
-
-    return response.get("value")
+    return driver.execute_cdp_cmd(cmd, params)
 
 
-def __get_pdf_from_html(path: str, timeout: int, install_driver: bool, print_options: dict):
+def _resolve_selenium_browser() -> tuple[str, str]:
+    chromium = resolve_chromium_binary()
+    chromedriver = resolve_chromedriver()
+    if not chromium:
+        raise RuntimeError("No Chromium executable found. Install chromium or set RAGFLOW_CHROMIUM_BINARY; refusing to download Chrome for Testing at runtime.")
+    if not chromedriver:
+        raise RuntimeError("No chromedriver executable found. Install chromium-driver or set RAGFLOW_CHROMEDRIVER; refusing to download a driver at runtime.")
+    return chromium, chromedriver
+
+
+def __get_pdf_from_html(path: str, timeout: int, print_options: dict):
+    chromium, chromedriver = _resolve_selenium_browser()
+
     webdriver_options = Options()
     webdriver_prefs = {}
-    webdriver_options.add_argument("--headless")
+    webdriver_options.binary_location = chromium
+    webdriver_options.add_argument("--headless=new")
     webdriver_options.add_argument("--disable-gpu")
     webdriver_options.add_argument("--no-sandbox")
     webdriver_options.add_argument("--disable-dev-shm-usage")
+    webdriver_options.add_argument("--disable-component-update")
+    webdriver_options.add_argument("--disable-background-networking")
+    webdriver_options.add_argument("--disable-sync")
+    webdriver_options.add_argument("--no-first-run")
+    webdriver_options.add_argument("--no-default-browser-check")
     webdriver_options.experimental_options["prefs"] = webdriver_prefs
 
     webdriver_prefs["profile.default_content_settings"] = {"images": 2}
 
     driver = None
     try:
-        if install_driver:
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=webdriver_options)
-        else:
-            driver = webdriver.Chrome(options=webdriver_options)
+        service = Service(chromedriver)
+        driver = webdriver.Chrome(service=service, options=webdriver_options)
 
         driver.set_page_load_timeout(BROWSER_FETCH_TIMEOUT)
         driver.set_script_timeout(BROWSER_FETCH_TIMEOUT)

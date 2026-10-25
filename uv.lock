@@ -8332,7 +8332,6 @@ dependencies = [
     { name = "volcengine" },
     { name = "voyageai" },
     { name = "webdav4" },
-    { name = "webdriver-manager" },
     { name = "wechatpy" },
     { name = "werkzeug" },
     { name = "wikipedia" },
@@ -8499,7 +8498,6 @@ requires-dist = [
     { name = "volcengine", specifier = "==1.0.194" },
     { name = "voyageai", specifier = "==0.2.3" },
     { name = "webdav4", specifier = ">=0.10.0,<0.11.0" },
-    { name = "webdriver-manager", specifier = "==4.0.1" },
     { name = "wechatpy", specifier = ">=1.8.18" },
     { name = "werkzeug", specifier = ">=3.1.7,<4" },
     { name = "wikipedia", specifier = "==1.4.0" },
@@ -10171,20 +10169,6 @@ dependencies = [
 sdist = { url = "https://mirrors.aliyun.com/pypi/packages/08/3d/d604f9d5195689e578f124f196a5d7e80f3106c8404f5c19b2181691de19/webdav4-0.10.0.tar.gz", hash = "sha256:387da6f0ee384e77149dddd9bcfd434afa155882f6c440a529a7cb458624407f" }
 wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/60/02/1b77232297fa52f7bedcf70f3ebe3817e9295f302389fb57dd0e6c077329/webdav4-0.10.0-py3-none-any.whl", hash = "sha256:8f915d72483e572089a3af0a2ad20c7e12d04eee9b9134eb718dbfa37af221d8" },
-]
-
-[[package]]
-name = "webdriver-manager"
-version = "4.0.1"
-source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
-dependencies = [
-    { name = "packaging" },
-    { name = "python-dotenv" },
-    { name = "requests" },
-]
-sdist = { url = "https://mirrors.aliyun.com/pypi/packages/e5/50/2958aa25647e86334b30b4f8c819cc4fd5f15d3d0115042a4c924ec6e94d/webdriver_manager-4.0.1.tar.gz", hash = "sha256:25ec177c6a2ce9c02fb8046f1b2732701a9418d6a977967bb065d840a3175d87" }
-wheels = [
-    { url = "https://mirrors.aliyun.com/pypi/packages/b1/51/b5c11cf739ac4eecde611794a0ec9df420d0239d51e73bc19eb44f02b48b/webdriver_manager-4.0.1-py2.py3-none-any.whl", hash = "sha256:d7970052295bb9cda2c1a24cf0b872dd2c41ababcc78f7b6b8dc37a41e979a7e" },
 ]
 
 [[package]]

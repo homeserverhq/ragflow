@@ -889,8 +889,10 @@ class FileService(CommonService):
                 # skipping DNS entirely and eliminating the rebinding window.
                 _map_rules = ",".join(f"MAP {h} {ip}" for h, ip in host_pins.items())
 
+                from common.browser_utils import ensure_crawl4ai_uses_system_chromium
                 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CrawlResult, DefaultMarkdownGenerator, PruningContentFilter
 
+                ensure_crawl4ai_uses_system_chromium()
                 filename = re.sub(r"\?.*", "", url.split("/")[-1])
 
                 async def adownload():

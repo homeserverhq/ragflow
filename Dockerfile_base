@@ -52,7 +52,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Python package and implicit dependencies:
 # opencv-python: libglib2.0-0 libglx-mesa0 libgl1
 # python-pptx:   default-jdk                              tika-server-standard-3.3.0.jar
-# selenium:      libatk-bridge2.0-0                       chrome-linux64-121-0-6167-85
+# selenium:      libatk-bridge2.0-0                       chromium (XtraDeb PPA)
 # Building C extensions: libpython3-dev libgtk-4-1 libnss3 xdg-utils libgbm-dev
 RUN --mount=type=cache,id=ragflow_apt,target=/var/cache/apt,sharing=locked \
     if [ "$NEED_MIRROR" == "1" ]; then \
@@ -184,16 +184,32 @@ RUN --mount=type=cache,id=ragflow_apt,target=/var/cache/apt,sharing=locked \
 
 
 
-# Install Chrome and ChromeDriver for selenium (from ragflow_deps image)
-RUN --mount=type=bind,from=infiniflow/ragflow_deps:latest,source=/chrome-linux64-121-0-6167-85,target=/chrome-linux64.zip \
-    unzip /chrome-linux64.zip && \
-    mv chrome-linux64 /opt/chrome && \
-    ln -s /opt/chrome/chrome /usr/local/bin/
-
-RUN --mount=type=bind,from=infiniflow/ragflow_deps:latest,source=/chromedriver-linux64-121-0-6167-85,target=/chromedriver-linux64.zip \
-    unzip -j /chromedriver-linux64.zip chromedriver-linux64/chromedriver && \
-    mv chromedriver /usr/local/bin/ && \
-    rm -f /usr/bin/google-chrome
+# Install Chromium and chromedriver from the XtraDeb PPA.
+# Ubuntu's chromium-browser package is a snap transitional shim and cannot run
+# inside a container. XtraDeb publishes real BSD-licensed Chromium .debs for
+# noble on amd64/arm64, including a version-matched chromedriver.
+RUN --mount=type=cache,id=ragflow_apt,target=/var/cache/apt,sharing=locked \
+    . /etc/os-release && \
+    install -d -m 0755 /usr/share/keyrings && \
+    curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x5301FA4FD93244FBC6F6149982BB6851C64F6880" \
+        | gpg --batch --yes --dearmor -o /usr/share/keyrings/xtradeb-apps.gpg && \
+    printf 'deb [signed-by=/usr/share/keyrings/xtradeb-apps.gpg] https://ppa.launchpadcontent.net/xtradeb/apps/ubuntu %s main\n' "${VERSION_CODENAME}" \
+        > /etc/apt/sources.list.d/xtradeb-apps.list && \
+    printf '%s\n' \
+        'Package: chromium-browser' \
+        'Pin: version 2:1snap*' \
+        'Pin-Priority: -1' \
+        '' \
+        'Package: chromium chromium-common chromium-driver chromium-sandbox' \
+        'Pin: release o=LP-PPA-xtradeb-apps' \
+        'Pin-Priority: 700' \
+        > /etc/apt/preferences.d/chromium-xtradeb && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        chromium chromium-common chromium-driver chromium-sandbox && \
+    rm -rf /opt/chrome /usr/local/bin/chrome /usr/local/bin/chromedriver /usr/bin/google-chrome && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN --mount=type=bind,from=infiniflow/ragflow_deps:latest,source=/,target=/deps \
     if [ "$(uname -m)" = "x86_64" ]; then \
