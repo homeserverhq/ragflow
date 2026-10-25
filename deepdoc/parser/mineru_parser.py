@@ -22,12 +22,14 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import zipfile
 from dataclasses import dataclass
 from io import BytesIO
 from os import PathLike
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse
 
 import numpy as np
 import pdfplumber
@@ -56,6 +58,11 @@ class MinerUContentType(StrEnum):
     FOOTER = "footer"
     PAGE_NUMBER = "page_number"
     DISCARDED = "discarded"
+    # MinerU 3.4.x VLM backend emits chart blocks for figures whose visual is a
+    # chart rather than a plain image. They carry chart_caption / chart_footnote
+    # / sub_type / img_path / bbox / page_idx — the same shape as IMAGE blocks —
+    # so they are routed through the image pipeline instead of being dropped.
+    CHART = "chart"
 
 
 # Mapping from language names to MinerU language codes
@@ -86,15 +93,13 @@ LANGUAGE_TO_MINERU_MAP = {
 
 
 class MinerUBackend(StrEnum):
-    """MinerU processing backend options."""
+    """MinerU processing backend options (current public API names)."""
 
-    PIPELINE = "pipeline"  # Traditional multimodel pipeline (default)
-    VLM_TRANSFORMERS = "vlm-transformers"  # Vision-language model using HuggingFace Transformers
-    VLM_MLX_ENGINE = "vlm-mlx-engine"  # Faster, requires Apple Silicon and macOS 13.5+
-    VLM_VLLM_ENGINE = "vlm-vllm-engine"  # Local vLLM engine, requires local GPU
-    VLM_VLLM_ASYNC_ENGINE = "vlm-vllm-async-engine"  # Asynchronous vLLM engine, new in MinerU API
-    VLM_LMDEPLOY_ENGINE = "vlm-lmdeploy-engine"  # LMDeploy engine
-    VLM_HTTP_CLIENT = "vlm-http-client"  # HTTP client for remote vLLM server (CPU only)
+    PIPELINE = "pipeline"
+    VLM_ENGINE = "vlm-engine"
+    HYBRID_ENGINE = "hybrid-engine"
+    VLM_HTTP_CLIENT = "vlm-http-client"
+    HYBRID_HTTP_CLIENT = "hybrid-http-client"
 
 
 class MinerULanguage(StrEnum):
@@ -142,13 +147,30 @@ class MinerUParseOptions:
 
 
 class MinerUParser(RAGFlowPdfParser):
-    def __init__(self, mineru_path: str = "mineru", mineru_api: str = "", mineru_server_url: str = ""):
+    def __init__(self, mineru_path: str = "mineru", mineru_api: str = "", mineru_server_url: str = "", mineru_api_token: str = ""):
         self.mineru_api = mineru_api.rstrip("/")
         self.mineru_server_url = mineru_server_url.rstrip("/")
+        self.mineru_api_token = mineru_api_token or ""
         self.outlines = []
         self.page_from = 0
         self.page_to = MAXIMUM_PAGE_NUMBER
         self.logger = logging.getLogger(self.__class__.__name__)
+        # Initialize the coverage stamp so the attribute exists from
+        # construction regardless of whether parse_pdf has run yet.
+        # ``vlm_configured`` is pre-seeded with ``False``; parse_pdf
+        # overwrites it with the actual vision-model status once it has
+        # the constructor wiring available. Pre-seeding means any
+        # caller that reads ``last_image_coverage[\"vlm_configured\"]``
+        # after _transfer_to_sections (but before parse_pdf fills it in)
+        # doesn't KeyError.
+        self.last_image_coverage: dict = {
+            "images_detected": 0,
+            "images_chunked": 0,
+            "images_described": 0,
+            "images_dropped_no_text": 0,
+            "images_unreadable_resource": 0,
+            "vlm_configured": False,
+        }
 
     @staticmethod
     def _is_zipinfo_symlink(member: zipfile.ZipInfo) -> bool:
@@ -234,7 +256,7 @@ class MinerUParser(RAGFlowPdfParser):
     def check_installation(self, backend: str = "pipeline", server_url: Optional[str] = None) -> tuple[bool, str]:
         reason = ""
 
-        valid_backends = ["pipeline", "vlm-http-client", "vlm-transformers", "vlm-vllm-engine", "vlm-mlx-engine", "vlm-vllm-async-engine", "vlm-lmdeploy-engine"]
+        valid_backends = [b.value for b in MinerUBackend]
         if backend not in valid_backends:
             reason = f"[MinerU] Invalid backend '{backend}'. Valid backends are: {valid_backends}"
             self.logger.warning(reason)
@@ -244,6 +266,13 @@ class MinerUParser(RAGFlowPdfParser):
             reason = "[MinerU] MINERU_APISERVER not configured."
             self.logger.warning(reason)
             return False, reason
+
+        if self._is_official_cloud():
+            ok, reason = self._check_official_cloud()
+            if not ok:
+                self.logger.warning(reason)
+                return False, reason
+            return True, ""
 
         api_openapi = f"{self.mineru_api}/openapi.json"
         try:
@@ -257,24 +286,246 @@ class MinerUParser(RAGFlowPdfParser):
             self.logger.warning(reason)
             return False, reason
 
-        if backend == "vlm-http-client":
+        if backend in (MinerUBackend.VLM_HTTP_CLIENT, MinerUBackend.HYBRID_HTTP_CLIENT):
             resolved_server = server_url or self.mineru_server_url
             if not resolved_server:
-                reason = "[MinerU] MINERU_SERVER_URL required for vlm-http-client backend."
+                reason = f"[MinerU] MINERU_SERVER_URL required for {backend} backend."
                 self.logger.warning(reason)
                 return False, reason
             try:
                 server_ok = self._is_http_endpoint_valid(resolved_server)
-                self.logger.info(f"[MinerU] vlm-http-client server check reachable={server_ok} url={resolved_server}")
+                self.logger.info(f"[MinerU] {backend} server check reachable={server_ok} url={resolved_server}")
             except Exception as exc:
-                self.logger.warning(f"[MinerU] vlm-http-client server probe failed: {resolved_server}: {exc}")
+                self.logger.warning(f"[MinerU] {backend} server probe failed: {resolved_server}: {exc}")
 
         return True, reason
 
     def _run_mineru(self, input_path: Path, output_dir: Path, options: MinerUParseOptions, callback: Optional[Callable] = None, *, page_from: int = 0, page_to: int = MAXIMUM_PAGE_NUMBER) -> Path:
         return self._run_mineru_api(input_path, output_dir, options, callback, page_from=page_from, page_to=page_to)
 
+    def _is_official_cloud(self) -> bool:
+        """True when mineru_api points at the hosted mineru.net API, not a self-hosted FastAPI server."""
+        parsed = urlparse(self.mineru_api or "")
+        host = (parsed.hostname or "").lower()
+        return host == "mineru.net" or host.endswith(".mineru.net")
+
+    def _official_origin(self) -> str:
+        parsed = urlparse(self.mineru_api or "")
+        host = (parsed.hostname or "").lower()
+        if host != "mineru.net" and not host.endswith(".mineru.net"):
+            raise RuntimeError(f"[MinerU] official API host required, got: {host or self.mineru_api}")
+        scheme = (parsed.scheme or "https").lower()
+        if scheme != "https":
+            raise RuntimeError("[MinerU] official mineru.net API requires HTTPS")
+        return f"https://{parsed.netloc}"
+
+    def _official_token(self) -> str:
+        token = (getattr(self, "mineru_api_token", "") or "").strip()
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        return token
+
+    @staticmethod
+    def _official_model_version(backend: str) -> str:
+        """Map a self-hosted backend name onto mineru.net model_version (pipeline / vlm)."""
+        name = (backend or MinerUBackend.PIPELINE).strip()
+        if name in (MinerUBackend.VLM_HTTP_CLIENT, MinerUBackend.VLM_ENGINE):
+            return "vlm"
+        return "pipeline"
+
+    @staticmethod
+    def _official_page_ranges(page_from: int, page_to: int) -> str | None:
+        """Translate RAGFlow's half-open page slice into mineru.net's 1-based page_ranges."""
+        if page_from <= 0 and page_to >= MAXIMUM_PAGE_NUMBER:
+            return None
+        start = max(page_from, 0) + 1
+        if page_to >= MAXIMUM_PAGE_NUMBER:
+            return None if start <= 1 else f"{start}-200"
+        end = max(page_to, start)
+        return f"{start}-{end}"
+
+    def _check_official_cloud(self) -> tuple[bool, str]:
+        """Probe mineru.net. A token uses the precise API; otherwise the no-login agent API.
+
+        The hosted site does not publish ``/openapi.json`` (that path is the self-hosted FastAPI spec).
+        """
+        try:
+            origin = self._official_origin()
+            token = self._official_token()
+            if token:
+                url = f"{origin}/api/v4/extract/task/ragflow-connectivity-probe"
+                response = requests.get(
+                    url,
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                    timeout=10,
+                )
+                if response.status_code in (401, 403):
+                    return False, f"[MinerU] official API authentication failed (HTTP {response.status_code}): {(response.text or '')[:300]}"
+                if response.status_code >= 500:
+                    return False, f"[MinerU] official precise API not accessible: {url} (HTTP {response.status_code})"
+                self.logger.info("[MinerU] official precise API reachable status=%s url=%s", response.status_code, url)
+                return True, ""
+
+            url = f"{origin}/api/v1/agent/parse/ragflow-connectivity-probe"
+            response = requests.get(url, headers={"Accept": "application/json"}, timeout=10)
+            if response.status_code >= 500:
+                return False, f"[MinerU] official agent API not accessible: {url} (HTTP {response.status_code})"
+            self.logger.info("[MinerU] official agent API reachable status=%s url=%s", response.status_code, url)
+            return True, ""
+        except RuntimeError as exc:
+            return False, str(exc)
+        except requests.RequestException as exc:
+            return False, f"[MinerU] official API check failed: {exc}"
+
+    def _official_auth_headers(self) -> dict[str, str]:
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        token = self._official_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    @staticmethod
+    def _official_payload(response: requests.Response) -> dict[str, Any]:
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if response.status_code >= 400 or not isinstance(body, dict):
+            raise RuntimeError(f"[MinerU] official API failed status={response.status_code} body={(response.text or '')[:2000]}")
+        if body.get("code") not in (0, "0"):
+            raise RuntimeError(f"[MinerU] official API failed code={body.get('code')} msg={body.get('msg')}")
+        data = body.get("data")
+        if not isinstance(data, dict):
+            raise RuntimeError(f"[MinerU] official API missing data: {body}")
+        return data
+
+    def _poll_official(self, url: str, headers: dict[str, str], callback: Optional[Callable], timeout: int = 1800) -> dict[str, Any]:
+        deadline = time.time() + timeout
+        while True:
+            response = requests.get(url, headers=headers, timeout=30)
+            data = self._official_payload(response)
+            state = data.get("state")
+            if state is None and isinstance(data.get("extract_result"), list) and data["extract_result"]:
+                state = data["extract_result"][0].get("state")
+                data = {**data, **data["extract_result"][0]}
+            if state == "done":
+                return data
+            if state == "failed":
+                raise RuntimeError(f"[MinerU] official task failed: {data.get('err_msg') or data}")
+            if time.time() >= deadline:
+                raise RuntimeError(f"[MinerU] official task timed out after {timeout}s (state={state})")
+            if callback:
+                callback(0.25, f"[MinerU] official task state={state or 'pending'}")
+            time.sleep(2)
+
+    def _run_mineru_official(self, input_path: Path, output_dir: Path, options: MinerUParseOptions, callback: Optional[Callable], *, page_from: int, page_to: int) -> Path:
+        pdf_file_path = str(input_path)
+        if not os.path.exists(pdf_file_path):
+            raise RuntimeError(f"[MinerU] PDF file not exists: {pdf_file_path}")
+
+        file_stem = Path(pdf_file_path).stem
+        output_path = Path(tempfile.mkdtemp(prefix=f"{file_stem.strip() or 'mineru'}_", dir=str(output_dir)))
+        backend = options.backend.value if isinstance(options.backend, MinerUBackend) else options.backend
+        if self._official_token():
+            self._run_mineru_official_precise(pdf_file_path, output_path, options, callback, backend=backend, page_from=page_from, page_to=page_to)
+        else:
+            self.logger.info("[MinerU] no API token; using mineru.net agent API (no-login, size/page limits apply). Set mineru_api_token to use the precise API.")
+            self._run_mineru_official_agent(pdf_file_path, output_path, options, callback, page_from=page_from, page_to=page_to)
+        return output_path
+
+    def _official_request_options(self, options: MinerUParseOptions, backend: str, page_from: int, page_to: int) -> tuple[dict[str, Any], str | None, str]:
+        payload: dict[str, Any] = {
+            "enable_formula": options.formula_enable,
+            "enable_table": options.table_enable,
+        }
+        method = options.method.value if isinstance(options.method, MinerUParseMethod) else options.method
+        if method == MinerUParseMethod.OCR.value:
+            payload["is_ocr"] = True
+        if isinstance(options.lang, MinerULanguage):
+            payload["language"] = options.lang.value
+        elif options.lang:
+            payload["language"] = options.lang
+        page_ranges = self._official_page_ranges(page_from, page_to)
+        model_version = self._official_model_version(backend)
+        return payload, page_ranges, model_version
+
+    def _run_mineru_official_precise(self, pdf_file_path: str, output_path: Path, options: MinerUParseOptions, callback: Optional[Callable], *, backend: str, page_from: int, page_to: int) -> None:
+        origin = self._official_origin()
+        headers = self._official_auth_headers()
+        file_name = Path(pdf_file_path).name
+        if not Path(file_name).suffix:
+            file_name += ".pdf"
+        shared, page_ranges, model_version = self._official_request_options(options, backend, page_from, page_to)
+        file_item: dict[str, Any] = {"name": file_name}
+        if "is_ocr" in shared:
+            file_item["is_ocr"] = shared.pop("is_ocr")
+        if page_ranges:
+            file_item["page_ranges"] = page_ranges
+        body = {**shared, "model_version": model_version, "files": [file_item]}
+        self.logger.info("[MinerU] official precise API %s/api/v4/file-urls/batch model_version=%s", origin, model_version)
+        if callback:
+            callback(0.20, "[MinerU] submit official precise parse task")
+        submit = requests.post(f"{origin}/api/v4/file-urls/batch", json=body, headers=headers, timeout=60)
+        data = self._official_payload(submit)
+        file_urls = data.get("file_urls") or []
+        batch_id = data.get("batch_id")
+        if not file_urls or not batch_id:
+            raise RuntimeError(f"[MinerU] official upload URL missing: {data}")
+        with open(pdf_file_path, "rb") as pdf_file:
+            uploaded = requests.put(file_urls[0], data=pdf_file, timeout=1800)
+        if uploaded.status_code not in (200, 201):
+            raise RuntimeError(f"[MinerU] official file upload failed status={uploaded.status_code} body={(uploaded.text or '')[:500]}")
+        result = self._poll_official(f"{origin}/api/v4/extract-results/batch/{batch_id}", headers, callback)
+        zip_url = result.get("full_zip_url")
+        if not zip_url:
+            raise RuntimeError(f"[MinerU] official result missing full_zip_url: {result}")
+        output_zip_path = output_path.parent / f"{output_path.name}.zip"
+        with requests.get(zip_url, timeout=1800, stream=True) as downloaded:
+            if not downloaded.ok:
+                raise RuntimeError(f"[MinerU] official zip download failed status={downloaded.status_code}")
+            with open(output_zip_path, "wb") as handle:
+                for chunk in downloaded.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+        self._extract_zip_no_root(output_zip_path, output_path, "")
+
+    def _run_mineru_official_agent(self, pdf_file_path: str, output_path: Path, options: MinerUParseOptions, callback: Optional[Callable], *, page_from: int, page_to: int) -> None:
+        origin = self._official_origin()
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        file_name = Path(pdf_file_path).name
+        if not Path(file_name).suffix:
+            file_name += ".pdf"
+        shared, page_ranges, _model_version = self._official_request_options(options, MinerUBackend.PIPELINE, page_from, page_to)
+        body: dict[str, Any] = {"file_name": file_name, **shared}
+        if page_ranges:
+            body["page_range"] = page_ranges
+        if callback:
+            callback(0.20, "[MinerU] submit official agent parse task")
+        submit = requests.post(f"{origin}/api/v1/agent/parse/file", json=body, headers=headers, timeout=60)
+        data = self._official_payload(submit)
+        task_id = data.get("task_id")
+        file_url = data.get("file_url")
+        if not task_id or not file_url:
+            raise RuntimeError(f"[MinerU] official agent upload URL missing: {data}")
+        with open(pdf_file_path, "rb") as pdf_file:
+            uploaded = requests.put(file_url, data=pdf_file, timeout=600)
+        if uploaded.status_code not in (200, 201):
+            raise RuntimeError(f"[MinerU] official agent file upload failed status={uploaded.status_code} body={(uploaded.text or '')[:500]}")
+        result = self._poll_official(f"{origin}/api/v1/agent/parse/{task_id}", headers, callback)
+        markdown_url = result.get("markdown_url")
+        if not markdown_url:
+            raise RuntimeError(f"[MinerU] official agent result missing markdown_url: {result}")
+        downloaded = requests.get(markdown_url, timeout=120)
+        if not downloaded.ok:
+            raise RuntimeError(f"[MinerU] official markdown download failed status={downloaded.status_code}")
+        content_list = [{"type": "text", "text": downloaded.text or "", "page_idx": 0}]
+        content_path = output_path / f"{Path(pdf_file_path).stem}_content_list.json"
+        content_path.write_text(json.dumps(content_list, ensure_ascii=False), encoding="utf-8")
+
     def _run_mineru_api(self, input_path: Path, output_dir: Path, options: MinerUParseOptions, callback: Optional[Callable] = None, *, page_from: int = 0, page_to: int = MAXIMUM_PAGE_NUMBER) -> Path:
+        if self._is_official_cloud():
+            return self._run_mineru_official(input_path, output_dir, options, callback, page_from=page_from, page_to=page_to)
+
         pdf_file_path = str(input_path)
 
         if not os.path.exists(pdf_file_path):
@@ -294,12 +545,11 @@ class MinerUParser(RAGFlowPdfParser):
 
         data = {
             "output_dir": "./output",
-            "lang_list": options.lang,
-            "backend": options.backend,
-            "parse_method": options.method,
+            "lang_list": options.lang.value if isinstance(options.lang, MinerULanguage) else options.lang,
+            "backend": options.backend.value if isinstance(options.backend, MinerUBackend) else options.backend,
+            "parse_method": options.method.value if isinstance(options.method, MinerUParseMethod) else options.method,
             "formula_enable": options.formula_enable,
             "table_enable": options.table_enable,
-            "server_url": None,
             "return_md": True,
             "return_middle_json": True,
             "return_model_output": True,
@@ -321,7 +571,7 @@ class MinerUParser(RAGFlowPdfParser):
 
         headers = {"Accept": "application/json"}
         try:
-            self.logger.info(f"[MinerU] invoke api: {self.mineru_api}/file_parse backend={options.backend} server_url={data.get('server_url')}")
+            self.logger.info(f"[MinerU] invoke api: {self.mineru_api}/file_parse backend={data['backend']} server_url={data.get('server_url')}")
             if callback:
                 callback(0.20, f"[MinerU] invoke api: {self.mineru_api}/file_parse")
             with open(pdf_file_path, "rb") as pdf_file:
@@ -334,7 +584,9 @@ class MinerUParser(RAGFlowPdfParser):
                     timeout=1800,
                     stream=True,
                 ) as response:
-                    response.raise_for_status()
+                    if not response.ok:
+                        body = (response.text or "")[:2000]
+                        raise RuntimeError(f"[MinerU] api failed status={response.status_code} body={body}")
                     content_type = response.headers.get("Content-Type", "")
                     if not content_type.startswith("application/zip"):
                         raise RuntimeError(f"[MinerU] not zip returned from api: {content_type}")
@@ -351,7 +603,14 @@ class MinerUParser(RAGFlowPdfParser):
             self.logger.info("[MinerU] Api completed successfully.")
             return Path(output_path)
         except requests.RequestException as e:
-            raise RuntimeError(f"[MinerU] api failed with exception {e}")
+            detail = ""
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    detail = f" body={(resp.text or '')[:2000]}"
+                except Exception:
+                    pass
+            raise RuntimeError(f"[MinerU] api failed with exception {e}{detail}") from e
 
     def __images__(self, fnm, zoomin: int = 1, page_from=0, page_to=MAXIMUM_PAGE_NUMBER, callback=None):
         self.page_from = page_from
@@ -560,14 +819,31 @@ class MinerUParser(RAGFlowPdfParser):
     @staticmethod
     def extract_positions(txt: str):
         poss = []
-        for tag in re.findall(r"@@[0-9-]+\t[0-9.\t]+##", txt):
-            pn, left, right, top, bottom = tag.strip("#").strip("@").split("\t")
-            left, right, top, bottom = float(left), float(right), float(top), float(bottom)
-            poss.append(([int(p) - 1 for p in pn.split("-")], left, right, top, bottom))
+        for tag in re.findall(r"@@[0-9-]+\t[-0-9.\t]+##", txt):
+            try:
+                pn, left, right, top, bottom = tag.strip("#").strip("@").split("\t")
+                left, right, top, bottom = float(left), float(right), float(top), float(bottom)
+                poss.append(([int(p) - 1 for p in pn.split("-")], left, right, top, bottom))
+            except ValueError:
+                # a '-' can land in a coordinate slot; skip the tag, as ExtractPositions in internal/deepdoc/parser/pdf/util/position.go does
+                continue
         return poss
 
     def _find_middle_json(self, output_dir: Path, subdir: Path, file_stem: str, safe_stem: str) -> Path | None:
-        middle_names = tuple(dict.fromkeys((f"{file_stem}_middle.json", f"{safe_stem}_middle.json", "middle.json")))
+        # Official mineru.net zip uses layout.json for the middle result, and may
+        # name files after a task UUID instead of the original PDF stem.
+        middle_names = tuple(
+            dict.fromkeys(
+                (
+                    f"{file_stem}_middle.json",
+                    f"{safe_stem}_middle.json",
+                    "middle.json",
+                    "layout.json",
+                    f"{file_stem}_layout.json",
+                    f"{safe_stem}_layout.json",
+                )
+            )
+        )
         for base in (subdir, output_dir):
             for name in middle_names:
                 candidate = base / name
@@ -575,11 +851,16 @@ class MinerUParser(RAGFlowPdfParser):
                     return candidate
 
         stem_dirs = tuple(dict.fromkeys((file_stem, safe_stem)))
-        for pattern in ("**/*_middle.json", "**/middle.json"):
+        unmatched = []
+        for pattern in ("**/*_middle.json", "**/middle.json", "**/*_layout.json", "**/layout.json"):
             for candidate in sorted(output_dir.glob(pattern)):
                 rel_parts = candidate.relative_to(output_dir).parts
                 if candidate.name in middle_names or any(stem_dir in rel_parts for stem_dir in stem_dirs):
                     return candidate
+                if candidate.name.endswith(("_middle.json", "_layout.json")) or candidate.name in {"middle.json", "layout.json"}:
+                    unmatched.append(candidate)
+        if len(unmatched) == 1:
+            return unmatched[0]
         return None
 
     @staticmethod
@@ -805,15 +1086,19 @@ class MinerUParser(RAGFlowPdfParser):
                 )
             patterns.extend(["**/content_list.json", "**/*_content_list.json"])
 
+            unmatched = []
             for pattern in patterns:
                 for candidate in sorted(output_dir.glob(pattern)):
                     self.logger.info(f"[MinerU] Trying fallback path: {candidate}")
-                    if candidate.name.endswith("_content_list.json"):
+                    if candidate.name.endswith("_content_list.json") or candidate.name == "content_list.json":
                         rel_parts = candidate.relative_to(output_dir).parts
                         in_stem_dir = any(stem_dir in rel_parts for stem_dir in stem_dirs)
                         stem_match = candidate.stem.startswith(file_stem) or candidate.stem.startswith(safe_stem)
                         if not (stem_match or in_stem_dir):
-                            self.logger.info(f"[MinerU] Skip unrelated fallback candidate: {candidate}")
+                            # Official mineru.net zip names files after a task UUID, not
+                            # the PDF stem. Keep the sole unmatched content_list.
+                            self.logger.info(f"[MinerU] Deferred unmatched fallback candidate: {candidate}")
+                            unmatched.append(candidate)
                             continue
                     attempted.append(candidate)
                     subdir = candidate.parent
@@ -821,6 +1106,16 @@ class MinerUParser(RAGFlowPdfParser):
                     break
                 if json_file:
                     break
+
+            if not json_file:
+                unique_unmatched = list(dict.fromkeys(unmatched))
+                if len(unique_unmatched) == 1:
+                    json_file = unique_unmatched[0]
+                    subdir = json_file.parent
+                    attempted.append(json_file)
+                    self.logger.info("[MinerU] Using sole unmatched content_list from official/zip output: %s", json_file)
+                elif unique_unmatched:
+                    attempted.extend(unique_unmatched)
 
         if not json_file:
             raise FileNotFoundError(f"[MinerU] Missing output file, tried: {', '.join(str(p) for p in attempted)}")
@@ -841,14 +1136,78 @@ class MinerUParser(RAGFlowPdfParser):
                     item[key] = str((subdir / item[key]).resolve())
         return data
 
+    def _select_configured_pages(self, outputs: list[dict[str, Any]], page_ranges, page_from: int) -> list[dict[str, Any]]:
+        """Keep only the blocks whose page falls inside ``page_ranges``.
+
+        The dispatcher covers every configured range with one request, so the PDF is
+        uploaded once. MinerU then also returns the pages between the ranges.
+
+        ``page_idx`` counts from ``page_from``. A configured range ``(s, e)`` selects
+        the 1-based pages ``s`` to ``e - 1``, because ``queue_tasks`` builds each task
+        stop with ``e = min(e - 1, pages)``. The end stays exclusive here so the merged
+        span selects the same pages that one task per range selected.
+
+        A cross-page table is one block whose ``page_idx`` is its first page and whose
+        ``_mineru_positions`` hold every page it covers. A table that starts on a gap
+        page and continues into a configured range must stay, so the block is kept when
+        any of its pages is in a range, not only the first one.
+        """
+        if not page_ranges:
+            return outputs
+
+        spans = [(int(s), int(e)) for s, e in page_ranges]
+        kept = []
+        for output in outputs:
+            pages = [output.get("page_idx")]
+            pages += [pos.get("page_idx") for pos in output.get("_mineru_positions") or []]
+            pages = [int(page_idx) for page_idx in pages if page_idx is not None]
+            if not pages:
+                # A block with no page cannot be placed on a gap page either. The rest of
+                # the parser already treats it as unplaced: _line_tag gives it no position
+                # and _middle_positions_for_output returns nothing for it. One task per
+                # range kept it too, so dropping it here would lose content.
+                kept.append(output)
+                continue
+            if any(s <= page_from + page_idx + 1 < e for page_idx in pages for s, e in spans):
+                kept.append(output)
+
+        dropped = len(outputs) - len(kept)
+        if dropped:
+            self.logger.info("[MinerU] Dropped %d block(s) outside the configured page ranges %s.", dropped, spans)
+        return kept
+
     def _transfer_to_sections(self, outputs: list[dict[str, Any]], parse_method: str = None, table_enable: bool = False):
         sections = []
         parse_method = (parse_method or "raw").lower()
+        # Track image coverage so silent loss of embedded PDF/DOCX images is
+        # queryable at the serialization boundary (issue #16978). When an
+        # IMAGE block yields nothing — no caption, no footnote, no VLM
+        # description — the image body is dropped from the chunk stream, so
+        # we surface that gap explicitly instead of letting it disappear.
+        image_coverage = {
+            "images_detected": 0,
+            "images_chunked": 0,
+            "images_dropped_no_text": 0,
+            "images_described": 0,
+            "images_unreadable_resource": 0,
+            # Pre-seeded so callers can read the key after this method
+            # returns without going through parse_pdf first. parse_pdf
+            # overwrites it with the real vision_model status.
+            "vlm_configured": False,
+        }
         for output in outputs:
             output_type = output.get("type")
+            # Count every visual block we see (IMAGE and CHART — MinerU emits
+            # both as visual content) so the image_coverage stamp reports
+            # "detected" symmetrically with "chunked" / "described" (which
+            # both already include CHART via _transfer_to_tables).
+            if output_type in {MinerUContentType.IMAGE, MinerUContentType.CHART}:
+                image_coverage["images_detected"] += 1
             # These chunkers consume tables and images separately, so exclude
             # media from their text sections. Raw consumers keep legacy sections.
-            if parse_method in {"naive", "manual", "paper"} and (output_type == MinerUContentType.IMAGE or (output_type == MinerUContentType.TABLE and table_enable)):
+            # Charts are routed the same way as images: MinerU emits them as
+            # visual blocks that _transfer_to_tables turns into image chunks.
+            if parse_method in {"naive", "manual", "paper"} and (output_type in {MinerUContentType.IMAGE, MinerUContentType.CHART} or (output_type == MinerUContentType.TABLE and table_enable)):
                 continue
 
             match output_type:
@@ -866,6 +1225,19 @@ class MinerUParser(RAGFlowPdfParser):
                     # the chunk so it becomes searchable / retrievable.
                     vlm_description = (output.get("vlm_description") or "").strip()
                     if vlm_description:
+                        image_coverage["images_described"] += 1
+                        section = (section.strip("\n") + "\n" + vlm_description).strip("\n") if section.strip() else vlm_description
+                    # Strip any residual newlines so the empty-after-strip case
+                    # ("\n" from empty caption+footnote joined by "\n") is
+                    # correctly counted as dropped at the boundary check below
+                    # (issue #16978).
+                    if not section.strip():
+                        section = ""
+                case MinerUContentType.CHART:
+                    section = "".join(output.get("chart_caption", [])) + "\n" + "".join(output.get("chart_footnote", []))
+                    vlm_description = (output.get("vlm_description") or "").strip()
+                    if vlm_description:
+                        image_coverage["images_described"] += 1
                         section = (section.strip("\n") + "\n" + vlm_description).strip("\n") if section.strip() else vlm_description
                 case MinerUContentType.EQUATION:
                     section = output.get("text", "")
@@ -886,7 +1258,7 @@ class MinerUParser(RAGFlowPdfParser):
                 case MinerUContentType.HEADER | MinerUContentType.FOOTER | MinerUContentType.PAGE_NUMBER | MinerUContentType.DISCARDED:
                     continue
                 case _:
-                    self.logger.debug("[MinerU] Skip unsupported section type=%s", output.get("type"))
+                    self.logger.warning("[MinerU] Skip unsupported section type=%s", output.get("type"))
                     continue
 
             # Only flatten table HTML when table extraction is disabled; the
@@ -894,8 +1266,30 @@ class MinerUParser(RAGFlowPdfParser):
             if output_type == MinerUContentType.TABLE and not table_enable:
                 section = self._sanitize_section_text(section)
             if not section:
-                self.logger.debug("[MinerU] Skip section after sanitization: type=%s", output.get("type"))
+                if output.get("type") in {MinerUContentType.IMAGE, MinerUContentType.CHART}:
+                    image_coverage["images_dropped_no_text"] += 1
+                    # DEBUG (not WARNING) because PDFs with many decorative
+                    # images would flood the log; the parse_pdf summary
+                    # already reports the aggregate dropped_no_text count.
+                    self.logger.debug(
+                        "[MinerU] Dropped embedded %s at page_idx=%s with no caption, footnote, or VLM description "
+                        "(img_path=%s). Configure an IMAGE2TEXT vision model to make embedded visuals retrievable.",
+                        "chart" if output.get("type") == MinerUContentType.CHART else "image",
+                        output.get("page_idx"),
+                        output.get("img_path"),
+                    )
+                else:
+                    self.logger.debug("[MinerU] Skip section after sanitization: type=%s", output.get("type"))
                 continue
+
+            # Mirror the same IMAGE/CHART scope as images_detected at the
+            # top of this loop and as images_chunked in
+            # _transfer_to_tables: a CHART block whose caption/footnote/
+            # vlm_description was emitted into a raw-mode text section is
+            # just as \"chunked\" as a caption-only IMAGE block — not
+            # silently dropped.
+            if output.get("type") in {MinerUContentType.IMAGE, MinerUContentType.CHART}:
+                image_coverage["images_chunked"] += 1
 
             if section and parse_method in {"manual", "pipeline"}:
                 sections.append((section, output["type"], self._line_tag(output)))
@@ -903,6 +1297,9 @@ class MinerUParser(RAGFlowPdfParser):
                 sections.append((section + self._line_tag(output), output["type"]))
             else:
                 sections.append((section, self._line_tag(output)))
+        # Stash on the instance so callers (and parse_pdf) can inspect the
+        # coverage stamp for the most recent parse.
+        self.last_image_coverage = image_coverage
         return sections
 
     def _transfer_to_tables(self, outputs: list[dict[str, Any]], table_enable: bool = True):
@@ -915,7 +1312,7 @@ class MinerUParser(RAGFlowPdfParser):
         tables = []
         for output in outputs:
             output_type = output.get("type")
-            if output_type not in {MinerUContentType.TABLE, MinerUContentType.IMAGE}:
+            if output_type not in {MinerUContentType.TABLE, MinerUContentType.IMAGE, MinerUContentType.CHART}:
                 continue
             if output_type == MinerUContentType.TABLE and not table_enable:
                 continue
@@ -933,10 +1330,21 @@ class MinerUParser(RAGFlowPdfParser):
                 tables.append(((None, text), positions))
                 continue
 
-            texts = [*output.get("image_caption", []), *output.get("image_footnote", [])]
+            # IMAGE and CHART share the same visual pipeline; only the caption
+            # field names differ (image_caption/image_footnote vs chart_*).
+            if output_type == MinerUContentType.CHART:
+                texts = [*output.get("chart_caption", []), *output.get("chart_footnote", [])]
+            else:
+                texts = [*output.get("image_caption", []), *output.get("image_footnote", [])]
             vlm_description = (output.get("vlm_description") or "").strip()
             if vlm_description:
                 texts.append(vlm_description)
+            # The text payload was non-empty if any of caption / footnote /
+            # vlm_description contributed a non-whitespace string. Use this
+            # to disambiguate "text was there but binary was unreadable"
+            # (images_unreadable_resource) from "text was empty" (text
+            # never made it into the chunk stream — images_dropped_no_text).
+            has_meaningful_text = any(t.strip() for t in texts)
 
             image = None
             image_path = output.get("img_path")
@@ -946,10 +1354,33 @@ class MinerUParser(RAGFlowPdfParser):
                         source.load()
                         image = source.copy()
                 except Exception as e:
-                    self.logger.warning(f"[MinerU] Failed to load image '{image_path}': {e}")
+                    self.logger.debug(f"[MinerU] Failed to load image '{image_path}': {e}")
             if image is None:
-                self.logger.warning("[MinerU] Skip image without a readable resource: %s", image_path)
+                self.logger.debug("[MinerU] Skip image without a readable resource: %s", image_path)
+                # Image.open() couldn't read the resource. Route the
+                # observation to whichever counter matches the underlying
+                # failure mode:
+                #   - has_meaningful_text → binary was unreadable; route to
+                #     images_unreadable_resource.
+                #   - text was empty → the image never made it into the
+                #     chunk stream at all; route to
+                #     images_dropped_no_text.
+                # The IMAGE block was detected (in _transfer_to_sections)
+                # but never produced an image chunk, so we do NOT count
+                # it as chunked/described here.
+                if has_meaningful_text:
+                    self.last_image_coverage["images_unreadable_resource"] += 1
+                else:
+                    self.last_image_coverage["images_dropped_no_text"] += 1
                 continue
+
+            # Count chunked/described only on confirmed emit (image actually
+            # reached the tables list). This avoids the brittle
+            # increment-then-decrement pattern that depends on every branch
+            # taking the right counter.
+            self.last_image_coverage["images_chunked"] += 1
+            if vlm_description:
+                self.last_image_coverage["images_described"] += 1
 
             tables.append(((image, texts or [""]), positions))
         return tables
@@ -957,15 +1388,17 @@ class MinerUParser(RAGFlowPdfParser):
     def _enhance_images_with_vlm(self, outputs: list[dict[str, Any]], vision_model, callback: Optional[Callable] = None, language: str = "English"):
         """Generate semantic descriptions for image blocks via the tenant's
         VISION model, mirroring deepdoc's VisionFigureParser. Each
-        IMAGE block with a readable img_path gets a ``vlm_description``
-        field that ``_transfer_to_sections`` then folds into the chunk
-        text — closing issue #14869.
+        IMAGE or CHART block with a readable img_path gets a
+        ``vlm_description`` field that ``_transfer_to_sections`` then folds
+        into the chunk text — closing issue #14869.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from rag.app.picture import vision_llm_chunk
         from rag.prompts.generator import vision_llm_figure_describe_prompt
 
-        image_jobs = [(idx, item) for idx, item in enumerate(outputs) if item.get("type") == MinerUContentType.IMAGE and item.get("img_path") and os.path.exists(item["img_path"])]
+        image_jobs = [
+            (idx, item) for idx, item in enumerate(outputs) if item.get("type") in {MinerUContentType.IMAGE, MinerUContentType.CHART} and item.get("img_path") and os.path.exists(item["img_path"])
+        ]
         if not image_jobs:
             return
 
@@ -1069,6 +1502,7 @@ class MinerUParser(RAGFlowPdfParser):
             )
             final_out_dir = self._run_mineru(pdf, out_dir, options, callback=callback, page_from=page_from, page_to=page_to)
             outputs = self._read_output(final_out_dir, pdf.stem, method=mineru_method_raw_str, backend=backend)
+            outputs = self._select_configured_pages(outputs, parser_cfg.get("pages"), page_from)
             self.logger.info(f"[MinerU] Parsed {len(outputs)} blocks from PDF.")
             if callback:
                 callback(0.75, f"[MinerU] Parsed {len(outputs)} blocks from PDF.")
@@ -1082,6 +1516,23 @@ class MinerUParser(RAGFlowPdfParser):
 
             sections = self._transfer_to_sections(outputs, parse_method, enable_table)
             tables = self._transfer_to_tables(outputs, enable_table) if (parse_method or "raw").lower() in {"naive", "manual", "paper"} else []
+            # Emit an image_coverage stamp so silent loss of embedded PDF/DOCX
+            # images is visible at the parser boundary (issue #16978). The
+            # vlm_configured flag tells operators whether downstream chunks
+            # could have been enriched by a vision model at all. The
+            # coverage dict is initialized in __init__ so this access is
+            # unconditional — see issue #16978.
+            coverage = self.last_image_coverage
+            coverage["vlm_configured"] = vision_model is not None
+            self.logger.info(
+                "[MinerU] image_coverage final detected=%s chunked=%s described=%s dropped_no_text=%s unreadable=%s vlm_configured=%s",
+                coverage["images_detected"],
+                coverage["images_chunked"],
+                coverage["images_described"],
+                coverage["images_dropped_no_text"],
+                coverage["images_unreadable_resource"],
+                coverage["vlm_configured"],
+            )
             return sections, tables
         finally:
             if temp_pdf and temp_pdf.exists():

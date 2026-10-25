@@ -24,13 +24,13 @@ from typing import Annotated, Any, Literal, Union, get_args, get_origin
 from uuid import UUID
 
 from quart import Request
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StringConstraints, ValidationError, field_validator, model_validator, ValidationInfo
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError, field_validator, model_validator, ValidationInfo
 from pydantic_core import PydanticCustomError
 from werkzeug.exceptions import BadRequest, UnsupportedMediaType
 
 from api.constants import DATASET_NAME_LIMIT, FILE_NAME_LEN_LIMIT
 from api.db import FileType
-from api.utils.pagination_utils import REST_API_MAX_IDS, validate_rest_api_page_size
+from api.utils.pagination_utils import validate_rest_api_page_size
 from common.constants import RetCode
 
 
@@ -175,15 +175,6 @@ def validate_and_parse_request_args(request: Request, validator: type[BaseModel]
         query_name = field_info.alias or field_name
         if query_name in request.args and _is_list_annotation(field_info.annotation):
             args[query_name] = [value for item in request.args.getlist(query_name) for value in item.split(",") if value]
-
-    # Handle ext parameter: parse JSON string to dict if it's a string
-    if "ext" in args and isinstance(args["ext"], str):
-        import json
-
-        try:
-            args["ext"] = json.loads(args["ext"])
-        except json.JSONDecodeError:
-            logging.debug("Failed to decode query arg 'ext' as JSON; passing raw value to validator")
 
     try:
         if extras is not None:
@@ -380,14 +371,6 @@ class RaptorConfig(Base):
 
         normalized = dict(value)
         changed_fields = []
-        legacy_ext = normalized.pop("ext", None)
-        if legacy_ext is not None:
-            changed_fields.append("ext")
-        if isinstance(legacy_ext, dict) and normalized.get("clustering_threshold") is None:
-            if "clustering_threshold" in legacy_ext:
-                normalized["clustering_threshold"] = legacy_ext["clustering_threshold"]
-                changed_fields.append("ext.clustering_threshold")
-
         for field in ("threshold", "clustering_method", "tree_builder"):
             if field in normalized:
                 normalized.pop(field)
@@ -450,6 +433,8 @@ TableColumnRole = Literal["indexing", "metadata", "both"]
 class ParserConfig(Base):
     """Complete parser configuration accepted by dataset APIs."""
 
+    model_config = ConfigDict(extra="allow", strict=True)
+
     auto_keywords: Annotated[int, Field(default=0, ge=0, le=32)]
     auto_questions: Annotated[int, Field(default=0, ge=0, le=10)]
     chunk_token_num: Annotated[int, Field(default=512, ge=1, le=2048)]
@@ -467,7 +452,6 @@ class ParserConfig(Base):
     task_page_size: Annotated[int | None, Field(default=None, ge=1)]
     pages: Annotated[list[list[int]] | None, Field(default=None)]
     compilation_template_group_id: Annotated[list[str], Field(default_factory=list)]
-    ext: Annotated[dict, Field(default={})]
     # Table parser: column name -> "indexing" | "metadata" | "both". Absence => all columns "both".
     # Table parser: "auto" = all columns both (default), "manual" = use table_column_roles. None → treated as "auto".
     table_column_mode: Annotated[Literal["auto", "manual"] | None, Field(default=None)]
@@ -475,6 +459,13 @@ class ParserConfig(Base):
     table_column_roles: Annotated[dict[str, TableColumnRole] | None, Field(default=None)]
     # Table parser: list of column names (set by backend after first parse; used by frontend for role selector).
     table_column_names: Annotated[list[str] | None, Field(default=None)]
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_ext(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "ext" in value:
+            raise ValueError("parser_config.ext is not supported; send parser configuration fields directly")
+        return value
 
     @field_validator("table_column_roles", mode="before")
     @classmethod
@@ -579,9 +570,9 @@ class CreateDatasetReq(Base):
     parse_type: Annotated[int | None, Field(default=None, ge=0, le=64)]
     pipeline_id: Annotated[str | None, Field(default=None, min_length=32, max_length=32, serialization_alias="pipeline_id")]
     chunk_method: Annotated[str | None, Field(default=None, serialization_alias="parser_id")]
+    language: Annotated[str | None, StringConstraints(strip_whitespace=True, min_length=1, max_length=32), Field(default=None)]
     parser_config: Annotated[ParserConfig | None, Field(default=None)]
     auto_metadata_config: Annotated[AutoMetadataConfig | None, Field(default=None)]
-    ext: Annotated[dict, Field(default={})]
 
     @field_validator("pipeline_id", mode="before")
     @classmethod
@@ -850,7 +841,6 @@ class UpdateDatasetReq(CreateDatasetReq):
     dataset_id: Annotated[str, Field(...)]
     name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=DATASET_NAME_LIMIT), Field(default="")]
     pagerank: Annotated[int, Field(default=0, ge=0, le=100)]
-    language: Annotated[str | None, Field(default=None, max_length=32)]
     connectors: Annotated[list[dict[str, Any]], Field(default_factory=list)]
 
     @field_validator("dataset_id", mode="before")
@@ -973,70 +963,6 @@ class DeleteDocumentReq(DeleteReq):
         return v_list
 
 
-class SearchDatasetReq(BaseModel):
-    """Request model for searching one dataset."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    question: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1), Field(...)]
-    doc_ids: Annotated[list[str], Field(default=[])]
-    page: Annotated[int, Field(default=1, ge=1)]
-    page_size: Annotated[int | None, Field(default=None, ge=1, le=100)]
-    size: Annotated[int, Field(default=30, ge=1, le=100)]
-    rerank_candidates_count: Annotated[int, Field(default=64, ge=1)]
-    knn_top_k: Annotated[int, Field(default=1024, ge=1, le=2048, validation_alias=AliasChoices("knn_top_k", "top_k"))]
-    knn_num_candidates: Annotated[int, Field(default=2048, ge=1, le=10000)]
-    similarity_threshold: Annotated[float, Field(default=0.0, ge=0.0, le=1.0)]
-    vector_similarity_weight: Annotated[float, Field(default=0.3, ge=0.0, le=1.0)]
-    use_kg: Annotated[bool, Field(default=False)]
-    cross_languages: Annotated[list[str], Field(default=[])]
-    keyword: Annotated[bool, Field(default=False)]
-    search_id: Annotated[str | None, Field(default=None)]
-    rerank_id: Annotated[str | None, Field(default=None)]
-    tenant_rerank_id: Annotated[str | None, Field(default=None)]
-    meta_data_filter: Annotated[dict | None, Field(default=None)]
-    include_knowledge_compilation: Annotated[bool, Field(default=True)]
-
-    @model_validator(mode="after")
-    def validate_knn_parameters(self):
-        if self.knn_num_candidates < self.knn_top_k:
-            raise ValueError("knn_num_candidates must be greater than or equal to knn_top_k")
-        return self
-
-
-class SearchDatasetsReq(BaseModel):
-    """Request model for searching multiple datasets."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    dataset_ids: Annotated[list[str], Field(..., min_length=1)]
-    question: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1), Field(...)]
-    doc_ids: Annotated[list[str], Field(default=[])]
-    page: Annotated[int, Field(default=1, ge=1)]
-    page_size: Annotated[int | None, Field(default=None, ge=1, le=100)]
-    size: Annotated[int, Field(default=30, ge=1, le=100)]
-    rerank_candidates_count: Annotated[int, Field(default=64, ge=1)]
-    knn_top_k: Annotated[int, Field(default=1024, ge=1, le=2048, validation_alias=AliasChoices("knn_top_k", "top_k"))]
-    knn_num_candidates: Annotated[int, Field(default=2048, ge=1, le=10000)]
-    similarity_threshold: Annotated[float, Field(default=0.0, ge=0.0, le=1.0)]
-    vector_similarity_weight: Annotated[float, Field(default=0.3, ge=0.0, le=1.0)]
-    use_kg: Annotated[bool, Field(default=False)]
-    cross_languages: Annotated[list[str], Field(default=[])]
-    keyword: Annotated[bool, Field(default=False)]
-    highlight: Annotated[bool, Field(default=False)]
-    search_id: Annotated[str | None, Field(default=None)]
-    rerank_id: Annotated[str | None, Field(default=None)]
-    tenant_rerank_id: Annotated[str | None, Field(default=None)]
-    meta_data_filter: Annotated[dict | None, Field(default=None)]
-    include_knowledge_compilation: Annotated[bool, Field(default=True)]
-
-    @model_validator(mode="after")
-    def validate_knn_parameters(self):
-        if self.knn_num_candidates < self.knn_top_k:
-            raise ValueError("knn_num_candidates must be greater than or equal to knn_top_k")
-        return self
-
-
 class BaseListReq(BaseModel):
     """Shared pagination and sorting fields for list APIs."""
 
@@ -1064,9 +990,11 @@ class BaseListReq(BaseModel):
 class ListDatasetReq(BaseListReq):
     """Request model for listing datasets."""
 
-    ids: Annotated[list[str] | None, Field(default=None, max_length=REST_API_MAX_IDS)]
+    ids: Annotated[list[str] | None, Field(default=None)]
     include_parsing_status: Annotated[bool, Field(default=False)]
-    ext: Annotated[dict, Field(default={})]
+    keywords: Annotated[str, Field(default="")]
+    owner_ids: Annotated[list[str], Field(default_factory=list)]
+    parser_id: Annotated[str | None, Field(default=None)]
 
     @field_validator("ids", mode="after")
     @classmethod
@@ -1078,11 +1006,8 @@ class ListDatasetReq(BaseListReq):
         for v in v_list:
             ids_list.append(validate_uuid1_hex(v))
 
-        duplicates = [item for item, count in Counter(ids_list).items() if count > 1]
-        if duplicates:
-            raise PydanticCustomError("duplicate_uuids", "Duplicate ids: '{duplicate_ids}'", {"duplicate_ids": ", ".join(duplicates)})
-
-        return ids_list
+        # A metadata lookup may include the same dataset from independent Retrieval blocks.
+        return list(dict.fromkeys(ids_list))
 
 
 # ---- File Management Request Models ----
@@ -1119,6 +1044,23 @@ class MoveFileReq(Base):
         return self
 
 
+FILE_ORDERABLE_COLUMNS = {
+    "id",
+    "parent_id",
+    "tenant_id",
+    "created_by",
+    "name",
+    "location",
+    "size",
+    "type",
+    "source_type",
+    "create_time",
+    "create_date",
+    "update_time",
+    "update_date",
+}
+
+
 class ListFileReq(BaseModel):
     """Request model for listing files."""
 
@@ -1130,6 +1072,13 @@ class ListFileReq(BaseModel):
     page_size: Annotated[int, Field(default=15, ge=1)]
     orderby: Annotated[str, Field(default="create_time")]
     desc: Annotated[bool, Field(default=True)]
+
+    @field_validator("orderby", mode="before")
+    @classmethod
+    def validate_orderby(cls, v: Any) -> Any:
+        if isinstance(v, str) and v not in FILE_ORDERABLE_COLUMNS:
+            return "create_time"
+        return v
 
     @field_validator("page_size")
     @classmethod

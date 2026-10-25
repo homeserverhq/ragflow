@@ -24,7 +24,6 @@ except Exception:
 import inspect
 import json
 import os
-import random
 import re
 import logging
 import tempfile
@@ -41,6 +40,8 @@ from common.misc_utils import get_uuid
 from common import settings
 
 from api.db.joint_services.memory_message_service import queue_save_to_memory_task
+
+_logger = logging.getLogger(__name__)
 
 
 def _valid_message_content(content: Any) -> list[str]:
@@ -233,6 +234,13 @@ class Message(ComponentBase):
                         all_content += t
                         cnt += t
                         yield t
+                if "@" in exp:
+                    source_component_id = exp.split("@", 1)[0]
+                    source_component = self._canvas.get_component_obj(source_component_id)
+                    if source_error := source_component.error():
+                        _logger.warning("Message stream stopped after source component error: %s", source_component_id)
+                        self.set_output("_ERROR", source_error)
+                        return
                 self.set_input_value(exp, cnt)
                 continue
             elif inspect.isawaitable(v):
@@ -276,7 +284,7 @@ class Message(ComponentBase):
         if self.check_if_canceled("Message processing"):
             return
 
-        rand_cnt = random.choice(_valid_message_content(self._param.content))
+        rand_cnt = "\n".join(_valid_message_content(self._param.content))
         if self._param.stream and not self._is_jinjia2(rand_cnt):
             self.set_output("content", partial(self._stream, rand_cnt))
             return

@@ -2,22 +2,6 @@ include:
   - ./docker-compose-base.yml
 # To ensure that the container processes the locally modified `service_conf.yaml.template` instead of the one included in its image, you need to mount the local `service_conf.yaml.template` to the container.
 services:
-  deepdoc:
-    image: ${DEEPDOC_IMAGE:-deepdoc_oss:latest}
-    profiles:
-      - deepdoc
-    build:
-      context: ..
-      dockerfile: Dockerfile_deepdoc_oss
-    networks:
-      - ragflow
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9390/health"]
-      interval: 10s
-      timeout: 10s
-      retries: 60
-
   ragflow-cpu:
     depends_on:
       mysql:
@@ -75,6 +59,7 @@ services:
       # - ./nginx/nginx.conf:/etc/nginx/nginx.conf
       - ./service_conf.yaml.template:/ragflow/conf/service_conf.yaml.template
       - ./entrypoint.sh:/ragflow/entrypoint.sh
+      # - ${RAGFLOW_SSH_KNOWN_HOSTS:-${HOME}/.ssh/known_hosts}:${SSH_KNOWN_HOSTS:-/etc/ragflow/ssh_known_hosts}:ro
     env_file: .env
     networks:
       - ragflow

@@ -11,7 +11,7 @@ import { IChunk } from '@/interfaces/database/dataset';
 import { sanitizeHtmlWithImagesAsText } from '@/utils/dom-util';
 import { CheckedState } from '@radix-ui/react-checkbox';
 import classNames from 'classnames';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type MouseEvent } from 'react';
 import { ChunkTextMode } from '../../constant';
 import styles from './index.module.less';
 
@@ -56,6 +56,10 @@ const ChunkCard = ({
     clickChunkCard(item.chunk_id);
   };
 
+  const handleControlClick = (e: MouseEvent) => {
+    e.stopPropagation();
+  };
+
   useEffect(() => {
     setEnabled(available === 1);
   }, [available]);
@@ -71,7 +75,7 @@ const ChunkCard = ({
       <div className="flex items-start justify-between gap-2">
         <Checkbox
           onCheckedChange={handleCheck}
-          onClick={(e) => e.stopPropagation()}
+          onClick={handleControlClick}
           checked={checked}
         ></Checkbox>
         {item.image_id && (
@@ -81,8 +85,12 @@ const ChunkCard = ({
               onMouseEnter={() => setOpen(true)}
               onMouseLeave={() => setOpen(false)}
             >
-              <div>
-                <Image id={item.image_id} className={styles.image}></Image>
+              <div onClick={handleControlClick}>
+                <Image
+                  id={item.image_id}
+                  documentId={item.doc_id}
+                  className={styles.image}
+                ></Image>
               </div>
             </PopoverTrigger>
             <PopoverContent
@@ -94,6 +102,7 @@ const ChunkCard = ({
               <div>
                 <Image
                   id={item.image_id}
+                  documentId={item.doc_id}
                   className={styles.imagePreview}
                 ></Image>
               </div>
@@ -113,7 +122,7 @@ const ChunkCard = ({
             })}
           ></div>
         </section>
-        <div onClick={(e) => e.stopPropagation()}>
+        <div onClick={handleControlClick}>
           <Switch
             checked={enabled}
             onCheckedChange={onChange}

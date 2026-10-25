@@ -20,7 +20,7 @@ from email.parser import BytesParser
 from rag.app.naive import chunk as naive_chunk
 from common.constants import MAXIMUM_PAGE_NUMBER
 import re
-from rag.nlp import rag_tokenizer, naive_merge, tokenize_chunks
+from rag.nlp import rag_tokenizer, naive_merge, tokenize_chunks, DEFAULT_DELIMITER
 from deepdoc.parser import HtmlParser, TxtParser
 from timeit import default_timer as timer
 import io
@@ -36,12 +36,12 @@ def chunk(
     **kwargs,
 ):
     """
-    Only eml is supported
+    EML and MSG are supported.
     """
     eng = lang.lower() == "english"  # is_english(cks)
     parser_config = kwargs.get(
         "parser_config",
-        {"chunk_token_num": 512, "delimiter": "\n!?。；！？", "layout_recognize": "DeepDOC"},
+        {"chunk_token_num": 512, "delimiter": DEFAULT_DELIMITER, "layout_recognize": "DeepDOC"},
     )
     doc = {
         "docnm_kwd": filename,
@@ -51,7 +51,12 @@ def chunk(
     main_res = []
     attachment_res = []
 
-    if binary is not None:
+    if filename.lower().endswith(".msg"):
+        import extract_msg
+
+        with extract_msg.Message(binary if binary is not None else filename) as outlook_msg:
+            msg = outlook_msg.asEmailMessage()
+    elif binary is not None:
         with io.BytesIO(binary) as buffer:
             msg = BytesParser(policy=policy.default).parse(buffer)
     else:
@@ -61,7 +66,8 @@ def chunk(
     text_txt, html_txt = [], []
     # get the email header info
     for header, value in msg.items():
-        text_txt.append(f"{header}: {value}")
+        if header.lower() in ("from", "to", "cc", "bcc", "date", "subject", "reply-to"):
+            text_txt.append(f"{header}: {value}")
 
     #  get the email main info
     def _add_content(msg, content_type):
@@ -88,7 +94,7 @@ def chunk(
             _decode_payload(payload, charset, html_txt)
         elif "multipart" in content_type:
             if msg.is_multipart():
-                for part in msg.iter_parts():
+                for part in msg.get_payload():
                     _add_content(part, part.get_content_type())
 
     _add_content(msg, msg.get_content_type())
@@ -99,13 +105,13 @@ def chunk(
     chunks = naive_merge(
         sections,
         int(parser_config.get("chunk_token_num", 128)),
-        parser_config.get("delimiter", "\n!?。；！？"),
+        parser_config.get("delimiter", DEFAULT_DELIMITER),
     )
 
     main_res.extend(tokenize_chunks(chunks, doc, eng, None, language=lang))
     logging.debug("naive_merge({}): {}".format(filename, timer() - st))
     # get the attachment info
-    for part in msg.iter_attachments():
+    for part in msg.walk():
         content_disposition = part.get("Content-Disposition")
         if content_disposition:
             dispositions = content_disposition.strip().split(";")

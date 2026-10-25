@@ -155,6 +155,21 @@ class LLMBundle(LLM4Tenant):
             return
         self.mdl.bind_tools(toolcall_session, tools)
 
+    def _accumulate_embedding_usage(self, used_tokens: int) -> None:
+        """Running total of real embedding tokens used across this bundle's
+        lifetime (one bundle per request; see get_models()). A single request
+        can call encode_queries (retrieval) and encode (e.g. insert_citations
+        embedding the answer for citation matching) multiple times, and
+        dialog_service.async_chat wants the request's total, not just the
+        last call — unlike last_usage on a chat model, which is deliberately
+        "last call only" (see chat_model.py's Base.last_usage)."""
+        prev = getattr(self, "last_usage", None) or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.last_usage = {
+            "prompt_tokens": prev["prompt_tokens"] + used_tokens,
+            "completion_tokens": 0,
+            "total_tokens": prev["total_tokens"] + used_tokens,
+        }
+
     def encode(self, texts: list):
         if self.langfuse:
             generation = self._start_langfuse_observation(trace_context=self.trace_context, as_type="generation", name="encode", model=self.model_config["llm_name"], input={"texts": texts})
@@ -202,6 +217,7 @@ class LLMBundle(LLM4Tenant):
             logging.debug("LLMBundle.encode query: {}, emd len: {}, used_tokens: {}. Builtin model don't need to update token usage".format(texts, len(embeddings), used_tokens))
         else:
             logging.info("LLMBundle.encode used_tokens: %d", used_tokens)
+            self._accumulate_embedding_usage(used_tokens)
 
         if self.langfuse:
             generation.update(usage_details={"total_tokens": used_tokens})
@@ -229,6 +245,7 @@ class LLMBundle(LLM4Tenant):
             logging.info("LLMBundle.encode_queries query: {}, emd len: {}, used_tokens: {}. Builtin model don't need to update token usage".format(query, len(emd), used_tokens))
         else:
             logging.info("LLMBundle.encode_queries used_tokens: %d", used_tokens)
+            self._accumulate_embedding_usage(used_tokens)
 
         if self.langfuse:
             generation.update(usage_details={"total_tokens": used_tokens})
@@ -473,7 +490,8 @@ class LLMBundle(LLM4Tenant):
         return queue
 
     async def async_chat(self, system: str, history: list, gen_conf: dict = {}, **kwargs):
-        if self.is_tools and hasattr(self.mdl, "async_chat_with_tools"):
+        has_bound_tools = bool(getattr(self.mdl, "tools", None))
+        if self.is_tools and getattr(self.mdl, "is_tools", False) and has_bound_tools and hasattr(self.mdl, "async_chat_with_tools"):
             base_fn = self.mdl.async_chat_with_tools
         elif hasattr(self.mdl, "async_chat"):
             base_fn = self.mdl.async_chat
@@ -518,8 +536,9 @@ class LLMBundle(LLM4Tenant):
         ans = ""
         _bundle_is_tools = self.is_tools
         _mdl_is_tools = getattr(self.mdl, "is_tools", False)
+        _has_bound_tools = bool(getattr(self.mdl, "tools", None))
         _has_with_tools = hasattr(self.mdl, "async_chat_streamly_with_tools")
-        if _bundle_is_tools and _mdl_is_tools and _has_with_tools:
+        if _bundle_is_tools and _mdl_is_tools and _has_bound_tools and _has_with_tools:
             stream_fn = getattr(self.mdl, "async_chat_streamly_with_tools", None)
         elif hasattr(self.mdl, "async_chat_streamly"):
             stream_fn = getattr(self.mdl, "async_chat_streamly", None)
@@ -557,6 +576,18 @@ class LLMBundle(LLM4Tenant):
                 raise
             if total_tokens:
                 logging.info("LLMBundle.async_chat_streamly used_tokens: %d", total_tokens)
+            # The streaming backend returns the authoritative total through
+            # the integer sentinel, but may not populate mdl.last_usage.
+            # Preserve that total so CountingChatModel can attribute it to
+            # the current phase instead of reporting zero tokens.
+            split = getattr(self.mdl, "last_usage", None) or {}
+            prompt_tokens = int(split.get("prompt_tokens", 0) or 0)
+            completion_tokens = int(split.get("completion_tokens", 0) or 0)
+            self.mdl.last_usage = {
+                "prompt_tokens": prompt_tokens if prompt_tokens + completion_tokens == total_tokens else 0,
+                "completion_tokens": completion_tokens if prompt_tokens + completion_tokens == total_tokens else 0,
+                "total_tokens": total_tokens,
+            }
             usage_details = self._report_usage(total_tokens)
             if generation:
                 generation.update(output={"output": ans}, usage_details=usage_details)
@@ -566,7 +597,8 @@ class LLMBundle(LLM4Tenant):
     async def async_chat_streamly_delta(self, system: str, history: list, gen_conf: dict = {}, **kwargs):
         total_tokens = 0
         ans = ""
-        if self.is_tools and getattr(self.mdl, "is_tools", False) and hasattr(self.mdl, "async_chat_streamly_with_tools"):
+        has_bound_tools = bool(getattr(self.mdl, "tools", None))
+        if self.is_tools and getattr(self.mdl, "is_tools", False) and has_bound_tools and hasattr(self.mdl, "async_chat_streamly_with_tools"):
             stream_fn = getattr(self.mdl, "async_chat_streamly_with_tools", None)
         elif hasattr(self.mdl, "async_chat_streamly"):
             stream_fn = getattr(self.mdl, "async_chat_streamly", None)
@@ -604,6 +636,16 @@ class LLMBundle(LLM4Tenant):
                 raise
             if total_tokens:
                 logging.info("LLMBundle.async_chat_streamly_delta used_tokens: %d", total_tokens)
+            # Streaming providers may expose only the integer total sentinel;
+            # make it available to the phase accounting proxy.
+            split = getattr(self.mdl, "last_usage", None) or {}
+            prompt_tokens = int(split.get("prompt_tokens", 0) or 0)
+            completion_tokens = int(split.get("completion_tokens", 0) or 0)
+            self.mdl.last_usage = {
+                "prompt_tokens": prompt_tokens if prompt_tokens + completion_tokens == total_tokens else 0,
+                "completion_tokens": completion_tokens if prompt_tokens + completion_tokens == total_tokens else 0,
+                "total_tokens": total_tokens,
+            }
             usage_details = self._report_usage(total_tokens)
             if generation:
                 generation.update(output={"output": ans}, usage_details=usage_details)

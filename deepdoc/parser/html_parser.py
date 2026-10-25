@@ -15,13 +15,12 @@
 #  limitations under the License.
 #
 
-from rag.nlp import find_codec, rag_tokenizer
+from rag.nlp import decode_text, rag_tokenizer
 import logging
 import re
 import uuid
 import chardet
 from bs4 import BeautifulSoup, NavigableString, Tag, Comment
-import html
 
 
 def get_encoding(file):
@@ -37,8 +36,7 @@ TITLE_TAGS = {"h1": "#", "h2": "##", "h3": "###", "h4": "####", "h5": "#####", "
 class RAGFlowHtmlParser:
     def __call__(self, fnm, binary=None, chunk_token_num=512):
         if binary is not None:
-            encoding = find_codec(binary)
-            txt = binary.decode(encoding, errors="ignore")
+            txt, _ = decode_text(binary, document_type="HTML document")
         else:
             with open(fnm, "r", encoding=get_encoding(fnm)) as f:
                 txt = f.read()
@@ -136,7 +134,7 @@ class RAGFlowHtmlParser:
             if str.lower(element.name) == "table":
                 table_info_list = []
                 table_id = str(uuid.uuid1())
-                table_list = [html.unescape(str(element))]
+                table_list = [str(element)]
                 for t in table_list:
                     table_info_list.append({"content": t, "tag_name": "table", "metadata": {"table_id": table_id, "index": table_list.index(t)}})
                 return table_info_list

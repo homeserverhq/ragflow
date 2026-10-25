@@ -194,10 +194,14 @@ class DoclingParser(RAGFlowPdfParser):
     @staticmethod
     def extract_positions(txt: str) -> list[tuple[list[int], float, float, float, float]]:
         poss = []
-        for tag in re.findall(r"@@[0-9-]+\t[0-9.\t]+##", txt):
-            pn, left, right, top, bottom = tag.strip("#").strip("@").split("\t")
-            left, right, top, bottom = float(left), float(right), float(top), float(bottom)
-            poss.append(([int(p) - 1 for p in pn.split("-")], left, right, top, bottom))
+        for tag in re.findall(r"@@[0-9-]+\t[-0-9.\t]+##", txt):
+            try:
+                pn, left, right, top, bottom = tag.strip("#").strip("@").split("\t")
+                left, right, top, bottom = float(left), float(right), float(top), float(bottom)
+                poss.append(([int(p) - 1 for p in pn.split("-")], left, right, top, bottom))
+            except ValueError:
+                # a '-' can land in a coordinate slot; skip the tag, as ExtractPositions in internal/deepdoc/parser/pdf/util/position.go does
+                continue
         return poss
 
     def crop(self, text: str, ZM: int = 1, need_position: bool = False):
@@ -216,11 +220,7 @@ class DoclingParser(RAGFlowPdfParser):
         if not getattr(self, "page_images", None):
             self.logger.warning("[Docling] crop called without page images; returning positions only.")
             if need_position:
-                positions = [
-                    (pns[0] + self.page_from, int(left), int(right), int(top), int(bottom))
-                    for pns, left, right, top, bottom in poss
-                    if pns
-                ]
+                positions = [(pns[0] + self.page_from, int(left), int(right), int(top), int(bottom)) for pns, left, right, top, bottom in poss if pns]
                 if positions:
                     return None, positions
             return (None, None) if need_position else None
@@ -590,10 +590,16 @@ class DoclingParser(RAGFlowPdfParser):
                 continue
             max_row = max(max_row, r1)
             max_col = max(max_col, c1)
-            specs.append({
-                "r0": r0, "c0": c0, "rowspan": r1 - r0, "colspan": c1 - c0,
-                "text": c.get("text"), "header": bool(c.get("column_header")),
-            })
+            specs.append(
+                {
+                    "r0": r0,
+                    "c0": c0,
+                    "rowspan": r1 - r0,
+                    "colspan": c1 - c0,
+                    "text": c.get("text"),
+                    "header": bool(c.get("column_header")),
+                }
+            )
         if not specs or max_row <= 0 or max_col <= 0:
             return ""
         anchor = {(s["r0"], s["c0"]): s for s in specs}
@@ -799,11 +805,7 @@ class DoclingParser(RAGFlowPdfParser):
                 "picture_description_area_threshold": float(os.environ.get("DOCLING_PICTURE_DESCRIPTION_AREA_THRESHOLD", "0.01") or 0.01),
             }
             base_opts.update(picture_opts)
-            self.logger.info(
-                f"[Docling] Picture description enabled via preset "
-                f"{picture_opts['picture_description_preset']} "
-                f"(area_threshold={picture_opts['picture_description_area_threshold']})."
-            )
+            self.logger.info(f"[Docling] Picture description enabled via preset {picture_opts['picture_description_preset']} (area_threshold={picture_opts['picture_description_area_threshold']}).")
 
         # Standard payloads
         # Standard fallback payloads (no chunking)

@@ -19,15 +19,15 @@ import json
 import logging
 import re
 from copy import deepcopy
-from typing import Tuple
-from jinja2.sandbox import SandboxedEnvironment
-import json_repair
 
+import json_repair
+from jinja2.sandbox import SandboxedEnvironment
+
+from common.constants import TAG_FLD
 from common.misc_utils import hash_str2int
+from common.token_utils import get_encoder, num_tokens_from_string
 from rag.nlp import rag_tokenizer
 from rag.prompts.template import load_prompt
-from common.constants import TAG_FLD
-from common.token_utils import encoder, num_tokens_from_string
 
 STOP_TOKEN = "<|STOP|>"
 COMPLETE_TASK = "complete_task"
@@ -83,7 +83,8 @@ def message_fit_in(msg, max_length=4000):
 
     def trim_content(content, limit):
         limit = max(0, limit)
-        return encoder.decode(encoder.encode(content)[:limit])
+        enc = get_encoder()
+        return enc.decode(enc.encode(content)[:limit])
 
     c = count()
     if c < max_length:
@@ -136,20 +137,15 @@ def message_fit_in(msg, max_length=4000):
     return count(), msg
 
 
-def kb_prompt(kbinfos, max_tokens, hash_id=False):
-    knowledges = [get_value(ck, "content", "content_with_weight") for ck in kbinfos["chunks"]]
-    kwlg_len = len(knowledges)
-    used_token_count = 0
-    chunks_num = 0
-    for i, c in enumerate(knowledges):
-        if not c:
-            continue
-        used_token_count += num_tokens_from_string(c)
-        chunks_num += 1
-        if max_tokens * 0.97 < used_token_count:
-            knowledges = knowledges[:i]
-            logging.warning(f"Not all the retrieval into prompt: {len(knowledges)}/{kwlg_len}")
-            break
+def _kb_block(ck, index: int, hash_id: bool = False) -> str | None:
+    """Render one knowledge block (id / title / url / metadata / content).
+
+    Returns None when the chunk carries no content, which kb_prompt treats as
+    "skip" (mirrors `if not c: continue`).
+    """
+    content = get_value(ck, "content", "content_with_weight")
+    if not content:
+        return None
 
     def draw_node(k, line):
         if line is not None and not isinstance(line, str):
@@ -158,19 +154,35 @@ def kb_prompt(kbinfos, max_tokens, hash_id=False):
             return ""
         return f"\n├── {k}: " + re.sub(r"\n+", " ", line, flags=re.DOTALL)
 
-    knowledges = []
-    for i, ck in enumerate(kbinfos["chunks"][:chunks_num]):
-        cnt = "\nID: {}".format(i if not hash_id else hash_str2int(get_value(ck, "id", "chunk_id"), 500))
-        cnt += draw_node("Title", get_value(ck, "docnm_kwd", "document_name"))
-        cnt += draw_node("URL", ck.get("url", ""))
-        meta = ck.get("document_metadata") or {}
-        for k, v in meta.items():
-            cnt += draw_node(k, v)
-        cnt += "\n└── Content:\n"
-        cnt += get_value(ck, "content", "content_with_weight")
-        knowledges.append(cnt)
+    cnt = "\nID: {}".format(index if not hash_id else hash_str2int(get_value(ck, "id", "chunk_id"), 500))
+    cnt += draw_node("Title", get_value(ck, "docnm_kwd", "document_name"))
+    cnt += draw_node("URL", ck.get("url", ""))
+    meta = ck.get("document_metadata") or {}
+    for k, v in meta.items():
+        cnt += draw_node(k, v)
+    cnt += "\n└── Content:\n"
+    cnt += content
+    return cnt
 
-    return knowledges
+
+def kb_prompt(kbinfos, max_tokens, hash_id=False):
+    chunks = kbinfos["chunks"]
+    used_token_count = 0
+    out: list[str] = []
+    for ck in chunks:
+        # Budget the COMPLETE block: the title / url / metadata decoration was
+        # previously invisible to the budget, so the rendered prompt could exceed
+        # the max_tokens it claims to enforce.
+        block = _kb_block(ck, len(out) + 1, hash_id)
+        if block is None:
+            continue
+        block_tokens = num_tokens_from_string(block)
+        if max_tokens * 0.97 < used_token_count + block_tokens:
+            logging.warning(f"Not all the retrieval into prompt: {len(out)}/{len(chunks)}")
+            break
+        used_token_count += block_tokens
+        out.append(block)
+    return out
 
 
 def memory_prompt(message_list, max_tokens):
@@ -213,7 +225,12 @@ PROMPT_JINJA_ENV = SandboxedEnvironment(autoescape=False, trim_blocks=True, lstr
 
 def citation_prompt(user_defined_prompts: dict = {}) -> str:
     template = PROMPT_JINJA_ENV.from_string(user_defined_prompts.get("citation_guidelines", CITATION_PROMPT_TEMPLATE))
-    return template.render() + "\n\nIMPORTANT: The example IDs above (45, 46, 78, etc.) are illustrative only. Use the actual chunk IDs from the provided knowledge blocks."
+    suffix = "\n\nIMPORTANT: The example IDs above (45, 46, 78, etc.) are illustrative only. Use the actual chunk IDs from the provided knowledge blocks."
+    # Range citations cannot be resolved to a single source; the ban is
+    # appended unconditionally so it also holds when a user overrides the
+    # template (matches Go's citationIDSuffix behavior).
+    suffix += " Cite each source INDIVIDUALLY: [ID:i][ID:j]. NEVER merge consecutive citations into a range such as [ID:i-j] or [ID:i~j]."
+    return template.render() + suffix
 
 
 def citation_plus(sources: str) -> str:
@@ -252,9 +269,9 @@ async def question_proposal(chat_mdl, content, topn=3):
 
 
 async def full_question(tenant_id=None, llm_id=None, messages=[], language=None, chat_mdl=None):
-    from common.constants import LLMType
-    from api.db.services.llm_service import LLMBundle
     from api.db.joint_services.tenant_model_service import resolve_model_config, resolve_model_type
+    from api.db.services.llm_service import LLMBundle
+    from common.constants import LLMType
 
     if not chat_mdl:
         model_types = resolve_model_type(tenant_id, llm_id)
@@ -288,13 +305,13 @@ async def full_question(tenant_id=None, llm_id=None, messages=[], language=None,
 
 
 async def cross_languages(tenant_id, llm_id, query, languages=[]):
-    from common.constants import LLMType
-    from api.db.services.llm_service import LLMBundle
     from api.db.joint_services.tenant_model_service import (
         get_tenant_default_model_by_type,
         resolve_model_config,
         resolve_model_type,
     )
+    from api.db.services.llm_service import LLMBundle
+    from common.constants import LLMType
 
     if llm_id and "vision" in resolve_model_type(tenant_id, llm_id):
         chat_model_config = resolve_model_config(tenant_id, LLMType.VISION, llm_id)
@@ -338,16 +355,25 @@ async def content_tagging(chat_mdl, content, all_tags, examples, topn=3):
     if kwd.find("**ERROR**") >= 0:
         raise Exception(kwd)
 
-    try:
-        obj = json_repair.loads(kwd)
-    except json_repair.JSONDecodeError:
-        try:
-            result = kwd.replace(rendered_prompt[:-1], "").replace("user", "").replace("model", "").strip()
-            result = "{" + result.split("{")[1].split("}")[0] + "}"
-            obj = json_repair.loads(result)
-        except Exception as e:
-            logging.exception(f"JSON parsing error: {result} -> {e}")
-            raise e
+    obj = json_repair.loads(kwd)
+    if isinstance(obj, list):
+        # A model that wraps the object in an array, or emits several objects in a row,
+        # parses to a list. The tags are still there, so merge the objects it holds.
+        merged = {}
+        found_object = False
+        for item in obj:
+            if isinstance(item, dict):
+                found_object = True
+                merged.update(item)
+        if not found_object:
+            logging.warning(f"content_tagging: reply parsed to a list of {len(obj)} values holding no object ({len(kwd)} chars).")
+            return {}
+        obj = merged
+    if not isinstance(obj, dict):
+        # A reply holding no JSON object parses to "", which used to reach .items() below.
+        # The reply can echo the chunk back, so log its shape rather than its content.
+        logging.warning(f"content_tagging: expected a JSON object of tags, got {type(obj).__name__} ({len(kwd)} chars).")
+        return {}
     res = {}
     for k, v in obj.items():
         try:
@@ -449,7 +475,7 @@ async def next_step_async(chat_mdl, history: list, tools_description: list[dict]
     return json_str, tk_cnt
 
 
-async def reflect_async(chat_mdl, history: list[dict], tool_call_res: list[Tuple], user_defined_prompts: dict = {}):
+async def reflect_async(chat_mdl, history: list[dict], tool_call_res: list[tuple], user_defined_prompts: dict = {}):
     tool_calls = [{"name": p[0], "result": p[1]} for p in tool_call_res]
     goal = history[1]["content"]
     template = PROMPT_JINJA_ENV.from_string(user_defined_prompts.get("reflection", REFLECT))
@@ -462,13 +488,13 @@ async def reflect_async(chat_mdl, history: list[dict], tool_call_res: list[Tuple
     _, msg = message_fit_in(hist, chat_mdl.max_length)
     ans = await chat_mdl.async_chat(msg[0]["content"], msg[1:])
     ans = re.sub(r"^.*</think>", "", ans, flags=re.DOTALL)
-    return """
+    return f"""
 **Observation**
-{}
+{json.dumps(tool_calls, ensure_ascii=False, indent=2)}
 
 **Reflection**
-{}
-    """.format(json.dumps(tool_calls, ensure_ascii=False, indent=2), ans)
+{ans}
+    """
 
 
 def form_message(system_prompt, user_prompt):
@@ -542,11 +568,32 @@ async def gen_meta_filter(chat_mdl, meta_data: dict, query: str, constraints: di
     return {"conditions": []}
 
 
-async def gen_json(system_prompt: str, user_prompt: str, chat_mdl, gen_conf={}, max_retry=2):
+class LLMProviderError(RuntimeError):
+    """The chat model reported a provider failure instead of an answer."""
+
+
+def _is_llm_error_answer(text) -> bool:
+    """Whether an LLM helper reported a failure in-band.
+
+    ``LLMBundle`` returns ``"**ERROR**: ..."`` instead of raising when a
+    provider call fails terminally, and that text can also reach the LLM cache.
+    """
+    return isinstance(text, str) and text.lstrip().lower().startswith("**error**")
+
+
+async def gen_json(system_prompt: str, user_prompt: str, chat_mdl, gen_conf={}, max_retry=2, raise_on_error: bool = False):
+    """Return the JSON answer parsed from the model's reply.
+
+    ``raise_on_error`` opts in to :class:`LLMProviderError` on a provider
+    failure. It is off by default because most callers treat a missing answer as
+    "no result", while callers that persist the result (wiki MAP) must not store
+    a failure as an empty answer — ``json_repair`` turns the error text into
+    ``''``, which is indistinguishable from a model that found nothing.
+    """
     from rag.graphrag.utils import get_llm_cache, set_llm_cache
 
     cached = get_llm_cache(chat_mdl.llm_name, system_prompt, user_prompt, gen_conf)
-    if cached:
+    if cached and not (raise_on_error and _is_llm_error_answer(cached)):
         return json_repair.loads(cached)
     _, msg = message_fit_in(form_message(system_prompt, user_prompt), chat_mdl.max_length)
     err = ""
@@ -555,6 +602,12 @@ async def gen_json(system_prompt: str, user_prompt: str, chat_mdl, gen_conf={}, 
         if ans and err:
             msg[-1]["content"] += f"\nGenerated JSON is as following:\n{ans}\nBut exception while loading:\n{err}\nPlease reconsider and correct it."
         ans = await chat_mdl.async_chat(msg[0]["content"], msg[1:], gen_conf=gen_conf)
+        if _is_llm_error_answer(ans):
+            if raise_on_error:
+                raise LLMProviderError(ans.strip().splitlines()[0][:500])
+            # Legacy behaviour for the other callers: report "no result", but
+            # never cache a provider failure as an answer.
+            return json_repair.loads(ans)
         ans = re.sub(r"(^.*</think>|```json\n|```\n*$)", "", ans, flags=re.DOTALL)
         try:
             res = json_repair.loads(ans)
@@ -824,7 +877,7 @@ def split_chunks(chunks, max_length: int):
 async def run_toc_from_text(chunks, chat_mdl, callback=None):
     input_budget = int(chat_mdl.max_length * INPUT_UTILIZATION) - num_tokens_from_string(TOC_FROM_TEXT_USER + TOC_FROM_TEXT_SYSTEM)
 
-    input_budget = 1024 if input_budget > 1024 else input_budget
+    input_budget = min(input_budget, 1024)
     chunk_sections = split_chunks(chunks, input_budget)
     titles = []
 
@@ -934,7 +987,7 @@ async def relevant_chunks_with_toc(query: str, toc: list[dict], chat_mdl, topn: 
                 if id not in id2score:
                     id2score[id] = []
                 id2score[id].append(sc["score"] / 5.0)
-        for id in id2score.keys():
+        for id in id2score:
             id2score[id] = np.mean(id2score[id])
         return [(id, sc) for id, sc in list(id2score.items()) if sc >= 0.3][:topn]
     except Exception as e:

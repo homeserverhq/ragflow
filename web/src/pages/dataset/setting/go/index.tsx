@@ -37,6 +37,7 @@ import {
   usePipelineDataList,
   useSaveDatasetSetting,
 } from './hooks';
+import { useRevealSubmitErrors } from './use-reveal-submit-errors';
 
 export default function DatasetSetting() {
   const { t } = useTranslation();
@@ -46,8 +47,6 @@ export default function DatasetSetting() {
     defaultValues: {
       parse_type: ParseType.BuiltIn,
       pipeline_id: '',
-      pipeline_name: '',
-      pipeline_avatar: '',
       parser_id: '',
       parser_config: {},
       name: '',
@@ -129,11 +128,12 @@ export default function DatasetSetting() {
 
   const { activeTab, setActiveTab } = useActiveTab(operatorNodes);
 
+  const { scrollContainerRef, handleInvalidSubmit } =
+    useRevealSubmitErrors(setActiveTab);
+
   useEffect(() => {
     if (parseType === ParseType.BuiltIn) {
       form.setValue('pipeline_id', '');
-      form.setValue('pipeline_name', '');
-      form.setValue('pipeline_avatar', '');
     }
   }, [parseType, form]);
 
@@ -142,17 +142,6 @@ export default function DatasetSetting() {
       await handleSave(data);
     },
     [handleSave],
-  );
-
-  const onInvalid = useCallback(
-    (errors: FieldErrors) => {
-      // Surface the first failing operator tab so its field errors are visible.
-      const firstOperatorId = Object.keys(errors?.parser_config ?? {})[0];
-      if (firstOperatorId) {
-        setActiveTab(firstOperatorId);
-      }
-    },
-    [setActiveTab],
   );
 
   const { errors } = useFormState({
@@ -209,10 +198,13 @@ export default function DatasetSetting() {
         <CardContent className="p-0 flex-1 h-0 flex divide-x-0.5">
           <Form {...form}>
             <form
-              onSubmit={form.handleSubmit(handleSubmit, onInvalid)}
+              onSubmit={form.handleSubmit(handleSubmit, handleInvalidSubmit)}
               className="flex flex-col"
             >
-              <div className="flex-1 h-0 w-[768px] px-5 pt-5 overflow-y-auto scrollbar-auto">
+              <div
+                ref={scrollContainerRef}
+                className="flex-1 h-0 w-[768px] px-5 pt-5 overflow-y-auto scrollbar-auto"
+              >
                 <section className="space-y-5 text-text-secondary">
                   <div className="text-base font-medium text-text-primary">
                     {t('knowledgeConfiguration.baseInfo')}
@@ -247,6 +239,7 @@ export default function DatasetSetting() {
                           | Record<string, FieldErrors | undefined>
                           | undefined
                       }
+                      fixedFileFormats
                     />
                   )}
 

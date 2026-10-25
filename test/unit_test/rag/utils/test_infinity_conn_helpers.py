@@ -31,7 +31,10 @@ pool and exercise the routing logic. Run with::
 import logging
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
 import pytest
+
+from common.doc_store.doc_store_base import MatchDenseExpr, OrderByExpr
 
 pytestmark = pytest.mark.p2
 
@@ -53,6 +56,33 @@ def _resolve_infinity_class():
 
 
 _Inf = _resolve_infinity_class()
+
+
+def test_dense_search_keeps_scope_filter_without_fulltext():
+    conn = _Inf.__new__(_Inf)
+    conn.dbName = "default_db"
+    conn.logger = logging.getLogger("test.infinity_dense_scope")
+    conn.equivalent_condition_to_str = lambda *_args: "doc_id IN ('doc-1') AND available_int=1"
+
+    builder = MagicMock()
+    for method in ("match_dense", "offset", "limit", "option"):
+        getattr(builder, method).return_value = builder
+    builder.to_df.return_value = (pd.DataFrame([{"id": "chunk-1", "SIMILARITY": 0.9, "pagerank_fea": 0.0}]), {"total_hits_count": 1})
+    table = MagicMock()
+    table.output.return_value = builder
+    db = MagicMock()
+    db.get_table.return_value = table
+    inf_conn = MagicMock()
+    inf_conn.get_database.return_value = db
+    conn.connPool = MagicMock()
+    conn.connPool.get_conn.return_value = inf_conn
+
+    dense = MatchDenseExpr("q_2_vec", [0.1, 0.2], "float", "cosine", 7, {"similarity": 0.17, "num_candidates": 19})
+    conn.search(["id"], [], {"doc_id": ["doc-1"], "available_int": 1}, [dense], OrderByExpr(), 0, 5, "ragflow_tenant", ["kb-1"])
+
+    options = builder.match_dense.call_args.args[-1]
+    assert options["filter"] == "doc_id IN ('doc-1') AND available_int=1"
+    assert "filter_fulltext" not in options["filter"]
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +329,60 @@ class TestEnsureColumns:
             )
 
         release.assert_called_once_with(inf_conn)
+
+
+class TestInsertShardsOversizedBatches:
+    """``insert`` shards at Infinity's "Insert batch row limit shouldn't more
+    than 8192" (error 3032); the id delete stays a single statement. A
+    18704-row wiki graph bucket used to be rejected as one statement."""
+
+    def _new_conn(self):
+        inst = _Inf.__new__(_Inf)
+        inst.dbName = "default_db"
+        inst.logger = logging.getLogger("test.infinity_conn_insert_shards")
+        inst.connPool = MagicMock()
+        return inst
+
+    def _run_insert(self, row_count):
+        conn = self._new_conn()
+        inf_conn = MagicMock()
+        db = MagicMock()
+        table = MagicMock()
+        # No embedding columns: the rows under test carry only ``id``.
+        table.show_columns.return_value.rows.return_value = []
+        db.get_table.return_value = table
+        inf_conn.get_database.return_value = db
+
+        docs = [{"id": f"id-{i}"} for i in range(row_count)]
+        with patch.object(conn.connPool, "get_conn", return_value=inf_conn), patch.object(conn.connPool, "release_conn") as release:
+            conn.insert(docs, "ragflow_tenant-A", "kb-1")
+
+        release.assert_called_once_with(inf_conn)
+        return table
+
+    def test_under_the_limit_is_a_single_statement(self):
+        table = self._run_insert(rag_infinity_conn._INFINITY_MAX_INSERT_ROWS)
+        assert [len(call.args[0]) for call in table.insert.call_args_list] == [rag_infinity_conn._INFINITY_MAX_INSERT_ROWS]
+        assert table.delete.call_count == 1
+
+    def test_reported_18704_row_bucket_is_sharded(self):
+        table = self._run_insert(18704)
+
+        batch_sizes = [len(call.args[0]) for call in table.insert.call_args_list]
+        assert batch_sizes == [8192, 8192, 2320]
+        assert max(batch_sizes) <= rag_infinity_conn._INFINITY_MAX_INSERT_ROWS
+
+        # The delete covers every id and is not sharded.
+        assert table.delete.call_count == 1
+        delete_filter = table.delete.call_args.args[0]
+        assert delete_filter.startswith("id IN (")
+        assert delete_filter.count("'id-") == 18704
+
+    def test_every_row_is_written_once_in_order(self):
+        table = self._run_insert(18704)
+
+        written = [row["id"] for call in table.insert.call_args_list for row in call.args[0]]
+        assert written == [f"id-{i}" for i in range(18704)]
 
 
 if __name__ == "__main__":

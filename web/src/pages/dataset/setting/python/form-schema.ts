@@ -45,60 +45,6 @@ export const formSchema = z
         mineru_formula_enable: z.boolean().optional(),
         mineru_table_enable: z.boolean().optional(),
         mineru_lang: z.string().optional(),
-        raptor: z
-          .object({
-            use_raptor: z.boolean().optional(),
-            prompt: z.string().optional(),
-            max_token: z.coerce.number().optional(),
-            threshold: z.coerce.number().optional(),
-            max_cluster: z.coerce.number().optional(),
-            random_seed: z.coerce.number().optional(),
-            scope: z.string().optional(),
-            clustering_method: z.enum(['gmm', 'ahc']).optional(),
-            tree_builder: z.enum(['raptor', 'psi']).optional(),
-            ext: z.record(z.string(), z.any()).optional(),
-          })
-          .refine(
-            (data) => {
-              if (data.use_raptor && !data.prompt) {
-                return false;
-              }
-              return true;
-            },
-            {
-              message: 'Prompt is required',
-              path: ['prompt'],
-            },
-          ),
-        graphrag: z
-          .object({
-            use_graphrag: z.boolean().optional(),
-            entity_types: z.array(z.string()).optional(),
-            method: z.string().optional(),
-            resolution: z.boolean().optional(),
-            community: z.boolean().optional(),
-            batch_chunk_token_size: z
-              .number()
-              .int()
-              .min(512)
-              .max(8196)
-              .optional(),
-          })
-          .refine(
-            (data) => {
-              if (
-                data.use_graphrag &&
-                (!data.entity_types || data.entity_types.length === 0)
-              ) {
-                return false;
-              }
-              return true;
-            },
-            {
-              message: 'Please enter Entity types',
-              path: ['entity_types'],
-            },
-          ),
         metadata: z.any().optional(),
         built_in_metadata: z
           .array(
@@ -111,7 +57,7 @@ export const formSchema = z
         enable_metadata: z.boolean().optional(),
         llm_id: z.string().optional(),
         // Table parser: "auto" = all columns both, "manual" = use column role selector
-        table_column_mode: z.enum(['auto', 'manual']).optional(),
+        table_column_mode: z.enum(['auto', 'manual']).nullish(),
         // Table parser: column name -> role (indexing | metadata | both); legacy "vectorize" -> indexing
         table_column_roles: z
           .record(
@@ -119,9 +65,9 @@ export const formSchema = z
               .enum(['indexing', 'metadata', 'both', 'vectorize'])
               .transform((role) => (role === 'vectorize' ? 'indexing' : role)),
           )
-          .optional(),
+          .nullish(),
         // Table parser: column names list (set by backend after first parse)
-        table_column_names: z.array(z.string()).optional(),
+        table_column_names: z.array(z.string()).nullish(),
       })
       .optional(),
     pagerank: z.number(),

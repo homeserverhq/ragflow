@@ -53,6 +53,7 @@ import {
   useUpdateSearch,
 } from '../next-searches/hooks';
 import { RerankFormFields } from '@/components/rerank';
+import { resolveInitialLlmSetting } from './llm-setting-defaults';
 import {
   SearchSettingFormData,
   useRevalidatePersistedModels,
@@ -81,7 +82,7 @@ function SearchSetting({
   const { formSchema, datasetsFetched } = useStaleDatasetFormSchema(
     searchSettingSchema,
     search_config?.kb_ids,
-    'search_config.kb_ids',
+    { fieldName: 'search_config.kb_ids' },
   );
   const formMethods = useForm<SearchSettingFormData>({
     resolver: zodResolver(formSchema),
@@ -116,10 +117,7 @@ function SearchSetting({
         llm_setting: {
           llm_id: search_config?.chat_id || '',
           parameter: llm_setting?.parameter || '',
-          temperature: llm_setting?.temperature || 0,
-          top_p: llm_setting?.top_p || 0,
-          frequency_penalty: llm_setting?.frequency_penalty || 0,
-          presence_penalty: llm_setting?.presence_penalty || 0,
+          ...resolveInitialLlmSetting(llm_setting),
         },
         chat_settingcross_languages: [],
         highlight: false,
@@ -157,13 +155,11 @@ function SearchSetting({
     }
   }, [open]);
 
-  const { rerankModelEnabled, aiSummaryEnabled } = useRevalidatePersistedModels(
-    {
-      control: formMethods.control,
-      trigger: formMethods.trigger,
-      modelsFetched,
-    },
-  );
+  const { rerankModelEnabled, llmRequired } = useRevalidatePersistedModels({
+    control: formMethods.control,
+    trigger: formMethods.trigger,
+    modelsFetched,
+  });
 
   const selectedKbIds = useWatch({
     control: formMethods.control,
@@ -413,9 +409,23 @@ function SearchSetting({
             />
             {rerankModelEnabled && (
               <>
-                <RerankFormFields prefix={'search_config.'}></RerankFormFields>
+                <RerankFormFields
+                  prefix={'search_config.'}
+                  required
+                ></RerankFormFields>
               </>
             )}
+            <LlmSettingFieldItems
+              prefix="search_config.llm_setting"
+              showCollapse
+              llmRequired={llmRequired}
+              showFields={[
+                'temperature',
+                'top_p',
+                'presence_penalty',
+                'frequency_penalty',
+              ]}
+            ></LlmSettingFieldItems>
             {/* AI Summary */}
             <FormField
               control={formMethods.control}
@@ -432,21 +442,6 @@ function SearchSetting({
                 </FormItem>
               )}
             />
-            {aiSummaryEnabled && (
-              // <LlmSettingFieldItems
-              //   prefix="search_config.llm_setting"
-              //   options={aiSummeryModelOptions}
-              // ></LlmSettingFieldItems>
-              <LlmSettingFieldItems
-                prefix="search_config.llm_setting"
-                showFields={[
-                  'temperature',
-                  'top_p',
-                  'presence_penalty',
-                  'frequency_penalty',
-                ]}
-              ></LlmSettingFieldItems>
-            )}
             {/* Feature Controls */}
             {/* <FormField
               control={formMethods.control}

@@ -12,11 +12,11 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-import argparse
 import time
 
+from rag.svr.task_executor_cli import log_task_executor_index_usage, parse_task_executor_args, resolve_task_executor_index
+from rag.svr.task_executor_refactor.recording_context import NullRecordingContext, RecordingContext, get_recording_context, set_recording_context, timed_with_recording
 from rag.svr.task_executor_refactor.task_manager import TaskManager
-from rag.svr.task_executor_refactor.recording_context import timed_with_recording, get_recording_context, RecordingContext, set_recording_context, NullRecordingContext
 
 start_ts = time.time()
 
@@ -26,24 +26,68 @@ import os
 
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")  # no internet, save about 10s
 
-from common.misc_utils import thread_pool_exec
-
 import asyncio
-import socket
+import copy
+import faulthandler
+import json
+import logging
+import os
 
 # from beartype import BeartypeConf
 # from beartype.claw import beartype_all  # <-- you didn't sign up for this
 # beartype_all(conf=BeartypeConf(violation_type=UserWarning))    # <-- emit warnings from all code
 import random
+import re
+import signal
+import socket
 import sys
 import threading
+from datetime import datetime
+from functools import partial
+from multiprocessing.context import TimeoutError
+from timeit import default_timer as timer
+
+import exceptiongroup
+import numpy as np
+import xxhash
+from peewee import DoesNotExist
 
 from api.db import PIPELINE_SPECIAL_PROGRESS_FREEZE_TASK_TYPES
-from api.db.services.knowledgebase_service import KnowledgebaseService
-from api.db.services.pipeline_operation_log_service import PipelineOperationLogService
+from api.db.db_models import close_connection
 from api.db.joint_services.memory_message_service import handle_save_to_memory_task
+from api.db.joint_services.tenant_model_service import get_model_config_by_id, get_tenant_default_model_by_type, resolve_model_config
+from api.db.services.doc_metadata_service import DocMetadataService
+from api.db.services.document_service import DocumentService
+from api.db.services.file2document_service import File2DocumentService
+from api.db.services.knowledgebase_service import KnowledgebaseService
+from api.db.services.llm_service import LLMBundle
+from api.db.services.pipeline_operation_log_service import PipelineOperationLogService
+from api.db.services.task_service import CANVAS_DEBUG_DOC_ID, GRAPH_RAPTOR_FAKE_DOC_ID, TaskService, has_canceled
+from common import settings
+from common.chunk_order import TOC_CHUNK_ORDER_BASE, assign_chunk_order, assign_derived_chunk_order, drop_parent_link
+from common.config_utils import show_configs
 from common.connection_utils import timeout
+from common.constants import PAGERANK_FLD, SVR_CONSUMER_GROUP_NAME, TAG_FLD, LLMType, ParserType, PipelineTaskType
+from common.exceptions import TaskCanceledException
+from common.llm_request_context import normalize_llm_user_id, reset_llm_request_context, set_llm_request_context
+from common.log_utils import init_root_logger
 from common.metadata_utils import turn2jsonschema, update_metadata_to
+from common.misc_utils import thread_pool_exec
+from common.signal_utils import start_tracemalloc_and_snapshot, stop_tracemalloc
+from common.token_utils import num_tokens_from_string, truncate
+from common.versions import get_ragflow_version
+from rag.app import audio, book, email, laws, manual, naive, one, paper, picture, presentation, qa, resume, table, tag
+from rag.graphrag.utils import chat_limiter, get_llm_cache, get_tags_from_cache, set_llm_cache, set_tags_to_cache
+from rag.nlp import DEFAULT_DELIMITER, add_positions, rag_tokenizer, search
+from rag.nlp import search as nlp_search
+from rag.prompts.generator import content_tagging, gen_metadata, keyword_extraction, question_proposal, run_toc_from_text
+from rag.svr.task_executor_limiter import (
+    chunk_limiter,
+    embed_limiter,
+    kg_limiter,
+    minio_limiter,
+    task_limiter,
+)
 from rag.utils.base64_image import image2id
 from rag.utils.raptor_utils import (
     RAPTOR_TREE_BUILDER,
@@ -53,57 +97,12 @@ from rag.utils.raptor_utils import (
     make_raptor_summary_chunk_id,
     should_skip_raptor,
 )
-from common.log_utils import init_root_logger
-from common.config_utils import show_configs
-from rag.graphrag.utils import get_llm_cache, set_llm_cache, get_tags_from_cache, set_tags_to_cache
-from rag.prompts.generator import keyword_extraction, question_proposal, content_tagging, run_toc_from_text, gen_metadata
-import logging
-import os
-from datetime import datetime
-import json
-import xxhash
-import copy
-import re
-from functools import partial
-from multiprocessing.context import TimeoutError
-from timeit import default_timer as timer
-import signal
-import exceptiongroup
-import faulthandler
-import numpy as np
-from peewee import DoesNotExist
-from common.constants import LLMType, ParserType, PipelineTaskType
-from api.db.services.document_service import DocumentService
-from api.db.services.doc_metadata_service import DocMetadataService
-from api.db.services.llm_service import LLMBundle
-from api.db.services.task_service import TaskService, has_canceled, CANVAS_DEBUG_DOC_ID, GRAPH_RAPTOR_FAKE_DOC_ID
-from api.db.services.file2document_service import File2DocumentService
-from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type, resolve_model_config, get_model_config_by_id
-from common.versions import get_ragflow_version
-from api.db.db_models import close_connection
-from rag.app import laws, paper, presentation, manual, qa, table, book, resume, picture, naive, one, audio, email, tag
-from rag.nlp import search, rag_tokenizer, add_positions
-
-from common.token_utils import num_tokens_from_string, truncate
 from rag.utils.redis_conn import REDIS_CONN, RedisDistributedLock
-from rag.graphrag.utils import chat_limiter
-from common.signal_utils import start_tracemalloc_and_snapshot, stop_tracemalloc
-from common.exceptions import TaskCanceledException
-from rag.svr.task_executor_limiter import (
-    task_limiter,
-    chunk_limiter,
-    embed_limiter,
-    minio_limiter,
-    kg_limiter,
-)
-from common import settings
-from common.constants import PAGERANK_FLD, TAG_FLD, SVR_CONSUMER_GROUP_NAME
 from rag.utils.table_es_metadata import (
     aggregate_table_doc_metadata,
     merge_table_parser_config_from_kb,
     table_parser_strip_doc_metadata_keys,
 )
-from rag.nlp import search as nlp_search
 
 BATCH_SIZE = 64
 
@@ -172,7 +171,33 @@ FAILED_TASKS = 0
 
 CURRENT_TASKS = {}
 
+
+def _redact_task_user(task: dict) -> dict:
+    """Copy a task dict for logs/heartbeat without the raw end-user identifier."""
+    payload = dict(task)
+    if "user_id" in payload:
+        payload["user_id"] = True
+    return payload
+
+
 WORKER_HEARTBEAT_TIMEOUT = int(os.environ.get("WORKER_HEARTBEAT_TIMEOUT", "120"))
+# Recycle the worker process after this many completed tasks to release memory
+# that long-lived libraries cannot reclaim on their own -- notably ONNX
+# Runtime's BFCArena, which holds every chunk it allocates until the
+# InferenceSession is destroyed. The supervisor loop in `docker/entrypoint.sh`
+# (`while true; do ... task_executor.py & wait; sleep 1; done`) restarts the
+# process automatically after a clean exit.
+# 0 disables recycling and preserves the existing behaviour. A small value such
+# as 20 helps on lower-VRAM consumer GPUs where cumulative arena fragmentation
+# eventually surfaces as "Available memory of 0" allocation failures.
+# The threshold is a soft one: tasks already in flight when it is reached are
+# allowed to finish, so a worker may complete up to MAX_CONCURRENT_TASKS - 1
+# extra tasks before it exits.
+MAX_TASKS_PER_WORKER = int(os.environ.get("MAX_TASKS_PER_WORKER", "0"))
+# Only used when recycling is enabled: how long to let in-flight task_managers
+# finish before cancelling them, so a single hung task cannot block the exit.
+RECYCLE_SHUTDOWN_TIMEOUT = float(os.environ.get("RECYCLE_SHUTDOWN_TIMEOUT", "300"))
+_completed_task_count = 0
 stop_event = threading.Event()
 
 
@@ -288,6 +313,10 @@ async def collect():
             task["tenant_id"] = msg["tenant_id"]
         task["source_id"] = msg["source_id"]
         task["message_dict"] = msg["message_dict"]
+    # Redis-only: Task rows have no user_id column. Copy it onto the in-memory
+    # task so handle_task can install LLM request context for embedding calls.
+    if msg.get("user_id"):
+        task["user_id"] = msg["user_id"]
     return redis_msg, task
 
 
@@ -342,7 +371,7 @@ async def build_chunks(task, progress_callback, on_chunking_start=None):
         "parser_id": task["parser_id"],
         "chunk_token_num": parser_config_for_chunk.get("chunk_token_num", 128),
         "overlapped_percent": normalize_overlapped_percent(parser_config_for_chunk.get("overlapped_percent", 0)),
-        "delimiter": parser_config_for_chunk.get("delimiter", "\n!?。；！？"),
+        "delimiter": parser_config_for_chunk.get("delimiter", DEFAULT_DELIMITER),
         "from_page": task["from_page"],
         "to_page": task["to_page"],
         "language": task["language"],
@@ -376,6 +405,9 @@ async def build_chunks(task, progress_callback, on_chunking_start=None):
         progress_callback(-1, "Internal server error while chunking: %s" % str(e).replace("'", ""))
         logging.exception("Chunking {}/{} got exception".format(task["location"], task["name"]))
         raise
+
+    # Stamp reading order before the parallel upload below reorders docs.
+    assign_chunk_order(cks, task["from_page"])
 
     # Record raw chunks for comparison
     get_recording_context().record("raw_chunks", cks)
@@ -469,12 +501,12 @@ async def build_chunks(task, progress_callback, on_chunking_start=None):
         try:
             await asyncio.gather(*tasks, return_exceptions=False)
         except Exception as e:
-            logging.error("Error in doc_keyword_extraction: {}".format(e))
+            logging.error(f"Error in doc_keyword_extraction: {e}")
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        progress_callback(msg="Keywords generation {} chunks completed in {:.2f}s".format(len(docs), timer() - st))
+        progress_callback(msg=f"Keywords generation {len(docs)} chunks completed in {timer() - st:.2f}s")
 
     # Record keywords extraction count
     keywords = [d for d in docs if d.get("important_kwd")]
@@ -510,7 +542,7 @@ async def build_chunks(task, progress_callback, on_chunking_start=None):
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        progress_callback(msg="Question generation {} chunks completed in {:.2f}s".format(len(docs), timer() - st))
+        progress_callback(msg=f"Question generation {len(docs)} chunks completed in {timer() - st:.2f}s")
 
     # Record question generation
     questions = [d for d in docs if d.get("question_kwd")]
@@ -572,7 +604,7 @@ async def build_chunks(task, progress_callback, on_chunking_start=None):
             metadata = update_metadata_to(metadata, existing_meta)
             ret = DocMetadataService.update_document_metadata(task["doc_id"], metadata)
             get_recording_context().save_func_return_value("DocMetadataService.update_document_metadata", ret)
-        progress_callback(msg="Question generation {} chunks completed in {:.2f}s".format(len(docs), timer() - st))
+        progress_callback(msg=f"Question generation {len(docs)} chunks completed in {timer() - st:.2f}s")
 
     # Record metadata generation count
     metadata_list = [d for d in docs if d.get("metadata_obj")]
@@ -635,12 +667,12 @@ async def build_chunks(task, progress_callback, on_chunking_start=None):
         try:
             await asyncio.gather(*tasks, return_exceptions=False)
         except Exception as e:
-            logging.error("Error tagging docs: {}".format(e))
+            logging.error(f"Error tagging docs: {e}")
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        progress_callback(msg="Tagging {} chunks completed in {:.2f}s".format(len(docs), timer() - st))
+        progress_callback(msg=f"Tagging {len(docs)} chunks completed in {timer() - st:.2f}s")
 
     # Record tags applied
     tags_applied = [d for d in docs if d.get(TAG_FLD)]
@@ -694,10 +726,16 @@ def build_TOC(task, docs, progress_callback):
 
     if toc:
         d = copy.deepcopy(docs[-1])
+        # The TOC row only borrows the last chunk's position columns. Its parent
+        # link must go, or insert_chunks derives a duplicate parent row from it.
+        drop_parent_link(d)
         d["content_with_weight"] = json.dumps(toc, ensure_ascii=False)
         d["toc_kwd"] = "toc"
         d["available_int"] = 0
         d["page_num_int"] = [100000000]
+        # Each parsing task builds its own TOC, so offset by the task's first
+        # page to keep a multi-range document's TOCs in range order.
+        d["chunk_order_int"] = TOC_CHUNK_ORDER_BASE + max(int(task.get("from_page") or 0), 0)
         d["id"] = xxhash.xxh64((d["content_with_weight"] + str(d["doc_id"])).encode("utf-8", "surrogatepass")).hexdigest()
         return d
     return None
@@ -745,7 +783,7 @@ async def embedding(docs, mdl, parser_config=None, callback=None):
         callback(prog=0.7 + 0.2 * (i + 1) / len(cnts), msg="")
     cnts = np.vstack(cnts_batches) if cnts_batches else np.array([])
     filename_embd_weight = parser_config.get("filename_embd_weight", 0.1)  # due to the db support none value
-    if not filename_embd_weight:
+    if filename_embd_weight is None:
         filename_embd_weight = 0.1
     title_w = float(filename_embd_weight)
     if tts.ndim == 2 and cnts.ndim == 2 and tts.shape == cnts.shape:
@@ -760,6 +798,19 @@ async def embedding(docs, mdl, parser_config=None, callback=None):
         vector_size = len(v)
         d["q_%d_vec" % len(v)] = v
     return tk_count, vector_size
+
+
+def _normalize_dataflow_output(chunks):
+    """Normalize pipeline output into the chunk shape used by indexing."""
+    if "chunks" in chunks:
+        return copy.deepcopy(chunks["chunks"]), "chunks"
+    if "json" in chunks:
+        return copy.deepcopy(chunks["json"]), "json"
+    for output_type in ("markdown", "text", "html"):
+        if output_type in chunks:
+            payload = chunks[output_type]
+            return ([{"text": payload}] if payload else []), output_type
+    return [], "empty"
 
 
 @timed_with_recording
@@ -806,24 +857,7 @@ async def run_dataflow(task: dict):
 
     embedding_token_consumption = chunks.get("embedding_token_consumption", 0)
     # The output key may exist with an empty payload; check presence, not truthiness.
-    if "chunks" in chunks:
-        chunks = copy.deepcopy(chunks["chunks"])
-        output_type = "chunks"
-    elif "json" in chunks:
-        chunks = copy.deepcopy(chunks["json"])
-        output_type = "json"
-    elif "markdown" in chunks:
-        chunks = [{"text": [chunks["markdown"]]}] if chunks["markdown"] else []
-        output_type = "markdown"
-    elif "text" in chunks:
-        chunks = [{"text": [chunks["text"]]}] if chunks["text"] else []
-        output_type = "text"
-    elif "html" in chunks:
-        chunks = [{"text": [chunks["html"]]}] if chunks["html"] else []
-        output_type = "html"
-    else:
-        chunks = []
-        output_type = "empty"
+    chunks, output_type = _normalize_dataflow_output(chunks)
 
     get_recording_context().record("pipeline_output_type", output_type)
     get_recording_context().record("pipeline_output_count", len(chunks))
@@ -939,9 +973,9 @@ async def run_dataflow(task: dict):
     except Exception:
         logging.exception("increment_chunk_num failed for doc %s", doc_id)
         ret = None
-    set_progress(task_id, prog=1.0, msg="Indexing done ({:.2f}s). Task done ({:.2f}s)".format(time_cost, task_time_cost))
+    set_progress(task_id, prog=1.0, msg=f"Indexing done ({time_cost:.2f}s). Task done ({task_time_cost:.2f}s)")
     get_recording_context().save_func_return_value("DocumentService.increment_chunk_num", ret)
-    logging.info("[Done], chunks({}), token({}), elapsed:{:.2f}".format(len(chunks), embedding_token_consumption, task_time_cost))
+    logging.info(f"[Done], chunks({len(chunks)}), token({embedding_token_consumption}), elapsed:{task_time_cost:.2f}")
     get_recording_context().record("dataflow_chunks", chunks)
     ret = PipelineOperationLogService.create(document_id=doc_id, pipeline_id=dataflow_id, task_type=PipelineTaskType.PARSE, dsl=str(pipeline))
     get_recording_context().save_func_return_value("PipelineOperationLogService.create", ret)
@@ -1300,7 +1334,7 @@ async def insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks, progre
         chunks: List of chunk dictionaries to insert
         progress_callback: Callback function for progress updates
     """
-    from rag.svr.task_executor_refactor.chunk_service import apply_source_chunks_document_availability
+    from rag.svr.task_executor_refactor.chunk_service import apply_source_chunks_document_availability, make_mother_chunk_id
 
     apply_source_chunks_document_availability(chunks)
 
@@ -1310,13 +1344,13 @@ async def insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks, progre
         mom = ck.get("mom") or ck.get("mom_with_weight") or ""
         if not mom:
             continue
-        id = xxhash.xxh64(mom.encode("utf-8")).hexdigest()
-        ck["mom_id"] = id
-        if id in mother_ids:
+        mom_id = make_mother_chunk_id(mom, ck.get("doc_id"))
+        ck["mom_id"] = mom_id
+        if mom_id in mother_ids:
             continue
-        mother_ids.add(id)
+        mother_ids.add(mom_id)
         mom_ck = copy.deepcopy(ck)
-        mom_ck["id"] = id
+        mom_ck["id"] = mom_id
         mom_ck["content_with_weight"] = mom
         mom_ck["available_int"] = 0
         flds = list(mom_ck.keys())
@@ -1324,6 +1358,9 @@ async def insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks, progre
             if fld not in ["id", "content_with_weight", "doc_id", "docnm_kwd", "kb_id", "available_int", "position_int", "create_timestamp_flt", "page_num_int", "top_int"]:
                 del mom_ck[fld]
         mothers.append(mom_ck)
+
+    # Parent rows must list after the source chunks they were derived from.
+    assign_derived_chunk_order(mothers)
 
     for b in range(0, len(mothers), settings.DOC_BULK_SIZE):
         ret = await thread_pool_exec(
@@ -1459,7 +1496,7 @@ async def do_handle_task(task):
         vts, _ = embedding_model.encode(["ok"])
         vector_size = len(vts[0])
     except Exception as e:
-        error_message = f"Fail to bind embedding model: {str(e)}"
+        error_message = f"Fail to bind embedding model: {e!s}"
         progress_callback(-1, msg=error_message)
         logging.exception(error_message)
         raise
@@ -1579,11 +1616,10 @@ async def do_handle_task(task):
             )
             logging.info(f"GraphRAG task result for task {task}:\n{result}")
         get_recording_context().record("graphrag_result", result)
-        progress_callback(prog=1.0, msg="Knowledge Graph done ({:.2f}s)".format(timer() - start_ts))
+        progress_callback(prog=1.0, msg=f"Knowledge Graph done ({timer() - start_ts:.2f}s)")
         return
     elif task_type == "mindmap":
         progress_callback(1, "place holder")
-        pass
         return
     elif task_type == "skill":
         progress_callback(-1, "Skill generation requires the refactored task executor (TE_RUN_MODE=0).")
@@ -1603,25 +1639,25 @@ async def do_handle_task(task):
         chunk_ids = [c.get("id") for c in chunks if isinstance(c, dict) and "id" in c]
         get_recording_context().record("chunk_ids_count", len(chunk_ids))
         # Record chunks array for content comparison (first, middle, last, random)
-        logging.info("Build document {}: {:.2f}s".format(task_document_name, timer() - start_ts))
+        logging.info(f"Build document {task_document_name}: {timer() - start_ts:.2f}s")
         if not chunks:
             progress_callback(1.0, msg=f"No chunk built from {task_document_name}")
             return
-        progress_callback(msg="Generate {} chunks".format(len(chunks)))
+        progress_callback(msg=f"Generate {len(chunks)} chunks")
         start_ts = timer()
         try:
             token_count, vector_size = await embedding(chunks, embedding_model, task_parser_config, progress_callback)
         except TaskCanceledException:
             raise
         except Exception as e:
-            error_message = "Generate embedding error:{}".format(str(e))
+            error_message = f"Generate embedding error:{e!s}"
             progress_callback(-1, error_message)
             logging.exception(error_message)
             token_count = 0
             raise
         get_recording_context().record("token_count", token_count)
         get_recording_context().record("vector_size", vector_size)
-        progress_message = "Embedding chunks ({:.2f}s)".format(timer() - start_ts)
+        progress_message = f"Embedding chunks ({timer() - start_ts:.2f}s)"
         logging.info(progress_message)
         progress_callback(msg=progress_message)
 
@@ -1662,7 +1698,7 @@ async def do_handle_task(task):
             if cleaned_chunks:
                 progress_callback(msg=f"Cleaned up {cleaned_chunks} stale RAPTOR chunks.")
 
-        logging.info("Indexing doc({}), page({}-{}), chunks({}), elapsed: {:.2f}".format(task_document_name, task_from_page, task_to_page, len(chunks), timer() - start_ts))
+        logging.info(f"Indexing doc({task_document_name}), page({task_from_page}-{task_to_page}), chunks({len(chunks)}), elapsed: {timer() - start_ts:.2f}")
 
         ret = DocumentService.increment_chunk_num(task_doc_id, task_dataset_id, token_count, chunk_count, 0)
         get_recording_context().save_func_return_value("DocumentService.increment_chunk_num", ret)
@@ -1702,7 +1738,7 @@ async def do_handle_task(task):
                     e,
                 )
 
-        progress_callback(msg="Indexing done ({:.2f}s).".format(timer() - start_ts))
+        progress_callback(msg=f"Indexing done ({timer() - start_ts:.2f}s).")
 
         if toc_thread:
             d = await toc_thread
@@ -1721,8 +1757,8 @@ async def do_handle_task(task):
 
         task_time_cost = timer() - task_start_ts
         get_recording_context().record("task_status", "completed")
-        progress_callback(prog=1.0, msg="Task done ({:.2f}s)".format(task_time_cost))
-        logging.info("Chunk doc({}), page({}-{}), chunks({}), token({}), elapsed:{:.2f}".format(task_document_name, task_from_page, task_to_page, len(chunks), token_count, task_time_cost))
+        progress_callback(prog=1.0, msg=f"Task done ({task_time_cost:.2f}s)")
+        logging.info(f"Chunk doc({task_document_name}), page({task_from_page}-{task_to_page}), chunks({len(chunks)}), token({token_count}), elapsed:{task_time_cost:.2f}")
 
     finally:
         if toc_thread is not None and not toc_thread.done():
@@ -1746,18 +1782,27 @@ async def do_handle_task(task):
                 logging.exception(f"Remove doc({task_doc_id}) from docStore failed when task({task_id}) canceled, exception: {e}")
 
 
-async def handle_task():
+async def handle_task() -> bool:
+    """Pull one task off the queue and process it.
+
+    Returns True if a real task was processed (success or failure), False if the
+    queue was empty and the call was an idle poll, so callers can tell work apart
+    from idling and e.g. avoid advancing the recycle counter during quiet periods.
+    """
     global DONE_TASKS, FAILED_TASKS
     redis_msg, task = await collect()
     if not task:
         await asyncio.sleep(5)
-        return
+        return False
+
+    logging.info(f"handle_task begin for task {json.dumps(task)}")
 
     task_type = task["task_type"]
     pipeline_task_type = TASK_TYPE_TO_PIPELINE_TASK_TYPE.get(task_type, PipelineTaskType.PARSE) or PipelineTaskType.PARSE
     task_id = task["id"]
+    ctx_token = set_llm_request_context(user_id=normalize_llm_user_id(task.get("user_id")))
     try:
-        CURRENT_TASKS[task["id"]] = copy.deepcopy(task)
+        CURRENT_TASKS[task["id"]] = _redact_task_user(copy.deepcopy(task))
         run_mode = os.environ.get("TE_RUN_MODE", "0")
         logging.info(f"TE_RUN_MODE is {run_mode}")
 
@@ -1780,7 +1825,7 @@ async def handle_task():
 
         DONE_TASKS += 1
         CURRENT_TASKS.pop(task_id, None)
-        logging.info(f"handle_task done for task {json.dumps(task)}")
+        logging.info(f"handle_task done for task {json.dumps(_redact_task_user(task))}")
     except TaskCanceledException as e:
         DONE_TASKS += 1
         CURRENT_TASKS.pop(task_id, None)
@@ -1795,10 +1840,10 @@ async def handle_task():
                 err_msg += " -- " + str(e)
             set_progress(task_id, prog=-1, msg=f"[Exception]: {err_msg}")
         except Exception as e:
-            logging.exception(f"[Exception]: {str(e)}")
-            pass
-        logging.exception(f"handle_task got exception for task {json.dumps(task)}")
+            logging.exception(f"[Exception]: {e!s}")
+        logging.exception(f"handle_task got exception for task {json.dumps(_redact_task_user(task))}")
     finally:
+        reset_llm_request_context(ctx_token)
         if not task.get("dataflow_id", ""):
             referred_document_id = None
             if task_type in _KB_FANOUT_TASK_TYPES:
@@ -1812,6 +1857,7 @@ async def handle_task():
             get_recording_context().save_func_return_value("PipelineOperationLogService.record_pipeline_operation", ret)
 
     redis_msg.ack()
+    return True
 
 
 async def get_server_ip() -> str:
@@ -1869,7 +1915,6 @@ async def report_status():
             logging.warning(f"Failed to report heartbeat: {e}")
         else:
             logging.debug(f"{CONSUMER_NAME} reported heartbeat: {heartbeat}")
-            pass
 
         # Clean up own expired heartbeat
         try:
@@ -1907,9 +1952,16 @@ async def report_status():
 
 
 async def task_manager():
+    global _completed_task_count
+    processed = False
     try:
-        await handle_task()
+        processed = await handle_task()
     finally:
+        if processed and MAX_TASKS_PER_WORKER > 0:
+            _completed_task_count += 1
+            if _completed_task_count >= MAX_TASKS_PER_WORKER:
+                logging.warning(f"[recycle] reached MAX_TASKS_PER_WORKER={MAX_TASKS_PER_WORKER}; signalling a clean exit so the supervisor can restart the worker.")
+                stop_event.set()
         task_limiter.release()
 
 
@@ -1958,9 +2010,24 @@ async def main():
     try:
         while not stop_event.is_set():
             await task_limiter.acquire()
+            if stop_event.is_set():
+                # Another task_manager signalled shutdown while we were blocked
+                # on the semaphore; bail out cleanly instead of picking up one
+                # more task, so the supervisor can restart the worker.
+                logging.info("[recycle] stop_event observed after acquiring task_limiter; releasing the semaphore and exiting the main loop.")
+                task_limiter.release()
+                break
             t = asyncio.create_task(task_manager())
             tasks.append(t)
     finally:
+        if MAX_TASKS_PER_WORKER > 0 and tasks:
+            # Recycling is a planned exit, so let in-flight task_managers finish
+            # instead of discarding their work -- but bound the wait so a single
+            # hung task cannot keep the worker alive forever.
+            _, pending = await asyncio.wait(tasks, timeout=RECYCLE_SHUTDOWN_TIMEOUT)
+            if pending:
+                logging.warning(f"[recycle] {len(pending)} task(s) still running after {RECYCLE_SHUTDOWN_TIMEOUT}s grace; cancelling them.")
+            tasks = list(pending)
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -1970,19 +2037,16 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Parse command line arguments (consistent with SAAS version)
-    parser = argparse.ArgumentParser(description="Task Executor")
-    parser.add_argument("-i", "--index", type=str, default="0")
-    parser.add_argument("-t", "--type", type=str, default="common", help="[common, graphrag, raptor, resume]")
-    args = parser.parse_args()
+    args = parse_task_executor_args()
 
     # Update global variables
     TASK_TYPE = args.type
-    TE_IDX = args.index
+    TE_IDX = resolve_task_executor_index(args)
     CONSUMER_NAME = f"task_executor_{TASK_TYPE}_{TE_IDX}"
 
     faulthandler.enable()
     init_root_logger(CONSUMER_NAME)
+    log_task_executor_index_usage(args)
     try:
         asyncio.run(main())
     except Exception as e:

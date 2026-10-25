@@ -1,4 +1,3 @@
-import message from '@/components/ui/message';
 import {
   useFetchAgent,
   useResetAgent,
@@ -11,57 +10,9 @@ import {
 import { formatDate } from '@/utils/date';
 import { useDebounceEffect } from 'ahooks';
 import { useCallback, useEffect, useState } from 'react';
-import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router';
-import { Operator } from '../constant';
-import { FormSchema as ParserFormSchema } from '../form/parser-form';
 import useGraphStore from '../store';
 import { useBuildDslData } from './use-build-dsl';
-
-/**
- * A node's form only validates while its panel is mounted, so bad values can
- * sit in the store long after the user has moved on. Re-check them against the
- * same schema before persisting, but only for nodes the user actually edited —
- * a node still carrying stale DSL from an older version must not wedge saving.
- */
-function findInvalidNode(nodes: RAGFlowNodeType[], editedNodeIds: string[]) {
-  return nodes.find(
-    (node) =>
-      editedNodeIds.includes(node.id) &&
-      node.data?.label === Operator.Parser &&
-      !ParserFormSchema.safeParse(node.data?.form).success,
-  );
-}
-
-export const useValidateNodeForms = () => {
-  const { t } = useTranslation();
-  const nodes = useGraphStore((state) => state.nodes);
-  const editedNodeFormIds = useGraphStore((state) => state.editedNodeFormIds);
-
-  const getInvalidNode = useCallback(
-    (currentNodes?: RAGFlowNodeType[]) =>
-      findInvalidNode(currentNodes ?? nodes, editedNodeFormIds),
-    [editedNodeFormIds, nodes],
-  );
-
-  // Only the entry points the user drives explicitly should warn; autosave and
-  // publish stay silent and just skip the write.
-  const notifyIfInvalid = useCallback(
-    (currentNodes?: RAGFlowNodeType[]) => {
-      const invalidNode = getInvalidNode(currentNodes);
-      if (invalidNode) {
-        message.warning(
-          t('flow.nodeFormInvalid', { name: invalidNode.data?.name }),
-        );
-        return false;
-      }
-      return true;
-    },
-    [getInvalidNode, t],
-  );
-
-  return { getInvalidNode, notifyIfInvalid };
-};
 
 export const useSaveGraph = (
   showMessage: boolean = true,
@@ -71,8 +22,10 @@ export const useSaveGraph = (
   const { setAgent, loading } = useSetAgent(showMessage, skipInvalidation);
   const { id } = useParams();
   const { buildDslData } = useBuildDslData();
-  const { getInvalidNode } = useValidateNodeForms();
 
+  // Saving is always allowed, even with unresolved canvas issues — those live
+  // in the canvas checklist (useCanvasChecklist) which gates the
+  // publish/run/embed/explore entry points instead.
   const saveGraph = useCallback(
     async (
       currentNodes?: RAGFlowNodeType[],
@@ -82,10 +35,6 @@ export const useSaveGraph = (
       release?: boolean,
     ) => {
       if (!id) {
-        return;
-      }
-
-      if (getInvalidNode(currentNodes)) {
         return;
       }
 
@@ -101,7 +50,7 @@ export const useSaveGraph = (
 
       return setAgent(params);
     },
-    [id, getInvalidNode, data.title, buildDslData, setAgent],
+    [id, data.title, buildDslData, setAgent],
   );
 
   return { saveGraph, loading };
@@ -110,14 +59,9 @@ export const useSaveGraph = (
 export const useSaveGraphBeforeOpeningDebugDrawer = (show: () => void) => {
   const { saveGraph, loading } = useSaveGraph();
   const { resetAgent } = useResetAgent();
-  const { notifyIfInvalid } = useValidateNodeForms();
 
   const handleRun = useCallback(
     async (nextNodes?: RAGFlowNodeType[]) => {
-      if (!notifyIfInvalid(nextNodes)) {
-        return;
-      }
-
       const saveRet = await saveGraph(nextNodes);
       if (saveRet?.code === 0) {
         // Call the reset api before opening the run drawer each time
@@ -128,7 +72,7 @@ export const useSaveGraphBeforeOpeningDebugDrawer = (show: () => void) => {
         }
       }
     },
-    [notifyIfInvalid, saveGraph, resetAgent, show],
+    [saveGraph, resetAgent, show],
   );
 
   return { handleRun, loading };

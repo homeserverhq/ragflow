@@ -8,8 +8,9 @@ import asyncio
 import importlib.util
 import json
 import os
+import re
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -31,7 +32,6 @@ from rag.advanced_rag.knowlege_compile.structure import (
     CONCEPT_MIN_CLAIMS,
     CONCEPT_MIN_SOURCES,
 )
-
 
 # ---- Test helpers ----------------------------------------------------------
 
@@ -80,6 +80,32 @@ class MockChatModel:
 
 
 @pytest.mark.asyncio
+async def test_load_refine_failures_decodes_persisted_page_markers(monkeypatch):
+    store = MagicMock()
+    store.index_exist.return_value = True
+    store.get_fields.return_value = {
+        "row-1": {
+            "slug_kwd": ["entity/alice"],
+            "content_with_weight": json.dumps({"entity_names": ["Alice"], "error": "429"}),
+        },
+        "row-2": {"slug_kwd": "entity/bob", "content_with_weight": "{}"},
+    }
+
+    async def fake_thread_pool_exec(*args, **kwargs):
+        return object()
+
+    monkeypatch.setattr(_wiki.settings, "docStoreConn", store)
+    monkeypatch.setattr(_wiki, "thread_pool_exec", fake_thread_pool_exec)
+
+    failures = await _wiki._wiki_load_refine_failures("tenant", "kb")
+
+    assert failures == {
+        "entity/alice": {"entity_names": ["Alice"], "error": "429"},
+        "entity/bob": {},
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "response",
     [
@@ -106,19 +132,18 @@ async def test_chat_mdl_ask_returns_normal_response():
 async def test_refine_page_does_not_persist_model_error_response():
     doc_store = make_doc_store()
 
-    with patch("common.settings.docStoreConn", doc_store):
-        with pytest.raises(RuntimeError, match="Wiki LLM call failed"):
-            await _wiki._wiki_refine_page(
-                mode="generate",
-                page_id="entity/Apple",
-                page_title="Apple",
-                existing_page=None,
-                chat_mdl=MockChatModel("**ERROR**: ERROR_MAX_RETRIES - upstream unavailable"),
-                embd_mdl=MockEmbeddingModel(),
-                tenant_id="t1",
-                kb_id="kb1",
-                page_version=0,
-            )
+    with patch("common.settings.docStoreConn", doc_store), pytest.raises(RuntimeError, match="Wiki LLM call failed"):
+        await _wiki._wiki_refine_page(
+            mode="generate",
+            page_id="entity/Apple",
+            page_title="Apple",
+            existing_page=None,
+            chat_mdl=MockChatModel("**ERROR**: ERROR_MAX_RETRIES - upstream unavailable"),
+            embd_mdl=MockEmbeddingModel(),
+            tenant_id="t1",
+            kb_id="kb1",
+            page_version=0,
+        )
 
     doc_store.insert.assert_not_called()
     doc_store.update.assert_not_called()
@@ -1091,6 +1116,9 @@ async def test_finalize_writes_outlinks():
             # the old-mode writer) which Infinity stores/reads back correctly.
             assert upd["outlinks_kwd"] == ["concept/B"], f"Got {upd['outlinks_kwd']}"
             assert upd["outlinks_int"] == 1
+            assert upd["available_int"] == 1
+            assert upd["doc_id"] == "kb1"
+            assert upd["content_with_weight"]
             break
     else:
         pytest.fail("No update for concept/A found")
@@ -1144,6 +1172,60 @@ async def test_finalize_auto_links_mentions():
 
 
 @pytest.mark.asyncio
+async def test_finalize_auto_link_prefers_longest_name_without_nested_links():
+    search_results = [
+        {
+            "_source": {
+                "slug_kwd": "entity/虎牢关",
+                "title_kwd": "虎牢关",
+                "md_with_weight": "虎牢关是关隘。",
+                "page_type_kwd": "entity",
+            }
+        },
+        {
+            "_source": {
+                "slug_kwd": "entity/关",
+                "title_kwd": "关",
+                "md_with_weight": "关是称谓。",
+                "page_type_kwd": "entity",
+            }
+        },
+        {
+            "_source": {
+                "slug_kwd": "concept/虎牢关之战",
+                "title_kwd": "虎牢关之战",
+                "md_with_weight": "虎牢关之战发生在关前。",
+                "page_type_kwd": "concept",
+            }
+        },
+    ]
+    doc_store = make_doc_store(search_results)
+
+    with (
+        patch("common.settings.docStoreConn", doc_store),
+        patch(f"{_wiki.__name__}._load_canonical_entities", new_callable=AsyncMock, return_value={}),
+    ):
+        await _wiki._wiki_finalize(tenant_id="t1", kb_id="kb1", embd_mdl=None)
+
+    update = next(args[0][1] for args in doc_store.update.call_args_list if args[0][0].get("id") == "concept/虎牢关之战")
+    body = update["md_with_weight"]
+    assert "[虎牢关](artifact/kb1/entity/虎牢关)" in body
+    assert "[关](artifact/kb1/entity/关)前" in body
+    assert "[虎牢[" not in body
+
+
+def test_find_unlinked_mention_skips_raw_and_rendered_links():
+    content = "[[entity/虎牢关|虎牢关]]与[虎牢关](artifact/kb1/entity/虎牢关)，关前"
+    assert _wiki._wiki_find_unlinked_mention(content, "虎牢关") == -1
+    assert _wiki._wiki_find_unlinked_mention(content, "关") == content.index("关前")
+
+
+def test_find_unlinked_mention_skips_unterminated_raw_link():
+    content = "before [[entity/X|Name"
+    assert _wiki._wiki_find_unlinked_mention(content, "Name") == -1
+
+
+@pytest.mark.asyncio
 async def test_finalize_preserves_merged_entity_name_as_link_label():
     """A merged page must not replace a member mention with its page title."""
     search_results = [
@@ -1184,13 +1266,6 @@ async def test_finalize_preserves_merged_entity_name_as_link_label():
 
     update = next(args[0][1] for args in doc_store.update.call_args_list if args[0][0].get("id") == "entity/曹操")
     assert "[治世之能臣，乱世之奸雄](artifact/kb1/entity/五色棒)" in update["md_with_weight"]
-
-
-def test_inside_wikilink():
-    content = "before [[entity/X]] after"
-    assert _wiki._inside_wikilink(content, content.index("entity"))
-    assert not _wiki._inside_wikilink(content, content.index("before"))
-    assert not _wiki._inside_wikilink(content, content.index("after"))
 
 
 def test_extract_outlinks_from_content():
@@ -1472,6 +1547,11 @@ def test_refine_page_persists_source_doc_ids_as_array():
     inserted_page = doc_store.insert.call_args.args[0][0]
     assert inserted_page["source_doc_ids"] == ["doc_1", "doc_2"]
     assert inserted_page["topic_kwd"] == "Technology companies"
+    assert inserted_page["available_int"] == 1
+    assert inserted_page["doc_id"] == "kb1"
+    assert inserted_page["kb_id"] == "kb1"
+    assert inserted_page["content_with_weight"] == inserted_page["md_with_weight"]
+    assert inserted_page["content_with_weight"]
 
 
 def test_topics_for_docs_only_returns_source_scoped_candidates():
@@ -2002,6 +2082,31 @@ async def test_reduce_entity_deletes_page_when_last_chunk_is_removed():
     assert [claim["statement"] for claim in delta["retractions"]] == ["only claim"]
 
 
+def test_canonical_entity_doc_stamps_retrieval_fields():
+    tokenizer = MagicMock()
+    tokenizer.tokenize.side_effect = lambda text: text
+    tokenizer.fine_grained_tokenize.side_effect = lambda text: text
+    with patch("rag.nlp.rag_tokenizer", tokenizer, create=True):
+        doc = _wiki._build_canonical_entity_doc(
+            tenant_id="t1",
+            kb_id="kb1",
+            entity_name="Apple",
+            entity_type="org",
+            aliases=["Apple Inc."],
+            source_doc_ids=["doc_1"],
+            claim_count=2,
+            embedding=[0.1, 0.2],
+        )
+
+    assert doc["available_int"] == 1
+    assert doc["doc_id"] == "kb1"
+    assert doc["kb_id"] == "kb1"
+    assert doc["content_with_weight"] == "Apple"
+    assert doc["content_ltks"] == "Apple"
+    assert doc["content_sm_ltks"] == "Apple"
+    assert doc["q_2_vec"] == [0.1, 0.2]
+
+
 def test_as_int_accepts_string_doc_store_values():
     assert _wiki._as_int("7") == 7
     assert _wiki._as_int(None, 3) == 3
@@ -2016,3 +2121,390 @@ def test_contextual_hints_accepts_native_string_relations():
 
     assert "[[entity/Beta]] — related" in hints
     assert "[[concept/Gamma]] — related" in hints
+
+
+@pytest.fixture
+def page_writer_retry(monkeypatch):
+    """Keep recovery tests deterministic without waiting on the wall clock."""
+    monkeypatch.setattr(_wiki, "WIKI_REFINE_LLM_RETRIES", 2, raising=False)
+    monkeypatch.setattr(_wiki, "WIKI_REFINE_LLM_RETRY_BASE_DELAY", 30, raising=False)
+    monkeypatch.setattr(_wiki, "WIKI_REFINE_LLM_RETRY_MAX_DELAY", 120, raising=False)
+    if hasattr(_wiki, "random"):
+        monkeypatch.setattr(_wiki.random, "uniform", lambda low, high: high)
+    sleep = AsyncMock()
+    monkeypatch.setattr(_wiki.asyncio, "sleep", sleep)
+    return sleep
+
+
+@pytest.mark.parametrize("failure", ["ERROR_MAX_RETRIES - Error code: 429 - 您已达到总请求数限制", "ERROR_QUOTA - Error code: 429 - per-minute quota exceeded"])
+@pytest.mark.parametrize("mode", ["generate", "modify", "re-synthesize"])
+async def test_refine_recovers_exhausted_llm_call_without_duplicate_writes(mode, failure, page_writer_retry, monkeypatch):
+    """A healthy page stays single-shot while only the throttled page retries."""
+    store = make_doc_store()
+    commit_module = ModuleType("api.db.services.file_commit_service")
+    commit_module.FileCommitService = MagicMock()
+    monkeypatch.setitem(sys.modules, "api.db.services.file_commit_service", commit_module)
+    tokenizer = MagicMock()
+    tokenizer.tokenize.side_effect = lambda text: text
+    tokenizer.fine_grained_tokenize.side_effect = lambda text: text
+    monkeypatch.setattr(sys.modules["rag.nlp"], "rag_tokenizer", tokenizer, raising=False)
+    monkeypatch.setattr(_wiki.settings, "docStoreConn", store)
+    healthy = MockChatModel("SUMMARY: Healthy\nTOPIC: General\nHealthy page.")
+    healthy.async_chat = AsyncMock(return_value=healthy._canned)
+    limited = MockChatModel()
+    limited.async_chat = AsyncMock(side_effect=[f"**ERROR**: {failure}", "SUMMARY: Recovered\nTOPIC: General\nRecovered page."])
+
+    async def refine(page_id, model):
+        """Run the real page-refinement path with the selected writing mode."""
+        return await _wiki._wiki_refine_page(
+            mode=mode,
+            page_id=page_id,
+            page_title=page_id,
+            existing_page=None if mode == "generate" else {"md_with_weight": "Previous page."},
+            claims=[],
+            source_chunks=[],
+            additions=[],
+            retractions=[],
+            available_pages=[],
+            chat_mdl=model,
+            embd_mdl=MockEmbeddingModel(),
+            tenant_id="t",
+            kb_id="kb",
+            page_version=0 if mode == "generate" else 4,
+            page_embedding=np.ones(8),
+        )
+
+    healthy_page, recovered_page = await asyncio.gather(refine("entity/healthy", healthy), refine("entity/limited", limited))
+
+    assert healthy.async_chat.await_count == 1
+    assert limited.async_chat.await_count == 2
+    assert page_writer_retry.await_args.args == (37.5,)
+    assert store.insert.call_count == 2
+    assert commit_module.FileCommitService.record_page_edit.call_count == 2
+    assert healthy_page["page_version_int"] == recovered_page["page_version_int"] == (1 if mode == "generate" else 5)
+    assert "**ERROR**" not in recovered_page["md_with_weight"]
+
+
+@pytest.mark.parametrize("failure", [TimeoutError(), ConnectionError(), RuntimeError("**ERROR**: ERROR_TIMEOUT - timed out"), RuntimeError("**ERROR**: ERROR_MAX_RETRIES - Error code: 503")])
+async def test_page_writer_recovers_transient_exception(failure, page_writer_retry, monkeypatch):
+    """Recover explicit transient exceptions after a bounded cooldown."""
+    ask = AsyncMock(side_effect=[failure, "Recovered"])
+    monkeypatch.setattr(_wiki, "_chat_mdl_ask", ask)
+    assert await _wiki._wiki_ask_page_writer(None, "system", "user", page_id="page") == "Recovered"
+    assert ask.await_count == 2
+    page_writer_retry.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "**ERROR**: ERROR_AUTHENTICATION - 401",
+        "**ERROR**: ERROR_INVALID_REQUEST - 400",
+        "**ERROR**: ERROR_QUOTA - 429 insufficient_quota",
+        "429 billing limit reached",
+        "429 账户额度不足",
+        "**ERROR**: ERROR_CONTENT_FILTER",
+        "**ERROR**: ERROR_MODEL",
+        "**ERROR**: ERROR_MAX_RETRIES - unknown failure",
+        "JSON parse failed",
+        "HTTP 401 rate limit",
+    ],
+)
+async def test_page_writer_does_not_retry_permanent_or_unknown_errors(error, page_writer_retry):
+    """Fail permanent and unclassified LLM errors without additional requests."""
+    model = MockChatModel()
+    model.async_chat = AsyncMock(side_effect=RuntimeError(error))
+    with pytest.raises(RuntimeError, match=re.escape(error)):
+        await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page")
+    assert model.async_chat.await_count == 1
+    page_writer_retry.assert_not_awaited()
+
+
+async def test_page_writer_exhaustion_is_bounded_and_does_not_persist(page_writer_retry, monkeypatch):
+    """Exhausted recovery leaves storage untouched and raises the final error."""
+    store = make_doc_store()
+    monkeypatch.setattr(_wiki.settings, "docStoreConn", store)
+    model = MockChatModel("**ERROR**: ERROR_MAX_RETRIES - 429 too many requests")
+    model.async_chat = AsyncMock(return_value=model._canned)
+    with pytest.raises(RuntimeError, match="Wiki LLM call failed"):
+        await _wiki._wiki_refine_page(mode="generate", page_id="page", page_title="page", existing_page=None, chat_mdl=model, embd_mdl=MockEmbeddingModel(), tenant_id="t", kb_id="kb", page_version=0)
+    assert model.async_chat.await_count == 3
+    assert [call.args[0] for call in page_writer_retry.await_args_list] == [37.5, 75]
+    store.insert.assert_not_called()
+    store.update.assert_not_called()
+
+
+async def test_page_writer_recovery_can_be_disabled(page_writer_retry, monkeypatch):
+    """A zero attempt limit preserves the single-call failure behavior."""
+    monkeypatch.setattr(_wiki, "WIKI_REFINE_LLM_RETRIES", 0)
+    model = MockChatModel()
+    model.async_chat = AsyncMock(side_effect=TimeoutError())
+    with pytest.raises(TimeoutError):
+        await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page")
+    assert model.async_chat.await_count == 1
+    page_writer_retry.assert_not_awaited()
+
+
+@pytest.mark.parametrize("retry_after, expected_delay, calls", [("90", 90, 2), ("invalid", 37.5, 2), ("600", None, 1)])
+async def test_page_writer_respects_retry_after_without_unbounded_wait(retry_after, expected_delay, calls, page_writer_retry):
+    """Honor reset delays within the cap and reject longer waits."""
+    error = RuntimeError("429 rate limit")
+    error.status_code = 429
+    error.response = SimpleNamespace(headers={"Retry-After": retry_after})
+    model = MockChatModel()
+    model.async_chat = AsyncMock(side_effect=[error, "Recovered"])
+    if expected_delay is None:
+        with pytest.raises(RuntimeError, match="429"):
+            await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page")
+        page_writer_retry.assert_not_awaited()
+    else:
+        assert await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page") == "Recovered"
+        page_writer_retry.assert_awaited_once_with(expected_delay)
+    assert model.async_chat.await_count == calls
+
+
+async def test_page_writer_cancellation_interrupts_recovery(page_writer_retry):
+    """Cancellation during the cooldown prevents further LLM attempts."""
+    model = MockChatModel()
+    model.async_chat = AsyncMock(side_effect=TimeoutError())
+    page_writer_retry.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page")
+    assert model.async_chat.await_count == 1
+
+
+async def test_page_writer_does_not_retry_persistence_errors(page_writer_retry, monkeypatch):
+    """Even a transient-looking storage error must not replay the LLM or writes."""
+    store = make_doc_store()
+    store.insert.side_effect = RuntimeError("503 storage unavailable")
+    monkeypatch.setattr(_wiki.settings, "docStoreConn", store)
+    model = MockChatModel("SUMMARY: Page\nTOPIC: General\nPage content.")
+    model.async_chat = AsyncMock(return_value=model._canned)
+    tokenizer = MagicMock()
+    tokenizer.tokenize.side_effect = lambda text: text
+    tokenizer.fine_grained_tokenize.side_effect = lambda text: text
+    monkeypatch.setattr(sys.modules["rag.nlp"], "rag_tokenizer", tokenizer, raising=False)
+    with pytest.raises(RuntimeError, match="503 storage"):
+        await _wiki._wiki_refine_page(
+            mode="generate", page_id="page", page_title="page", existing_page=None, chat_mdl=model, embd_mdl=MockEmbeddingModel(), tenant_id="t", kb_id="kb", page_version=0, page_embedding=np.ones(8)
+        )
+    assert model.async_chat.await_count == 1
+    store.insert.assert_called_once()
+    page_writer_retry.assert_not_awaited()
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-10", "bad date"])
+def test_page_writer_ignores_invalid_retry_after(value):
+    """Invalid and non-finite reset values fall back to normal backoff."""
+    error = RuntimeError("429")
+    error.response = SimpleNamespace(headers={"Retry-After": value})
+    assert _wiki._wiki_retry_after(error) == 0
+
+
+def test_page_writer_parses_http_date_retry_after():
+    """Parse the HTTP-date form of the server reset time."""
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+
+    error = RuntimeError("429")
+    error.response = SimpleNamespace(headers={"Retry-After": format_datetime(datetime.now(UTC) + timedelta(seconds=90), usegmt=True)})
+    assert 88 <= _wiki._wiki_retry_after(error) <= 90
+
+
+@pytest.mark.parametrize("base_delay,max_delay", [(0, 0), (0, 120), (30, 0)])
+async def test_page_writer_zero_delay_disables_recovery(base_delay, max_delay, page_writer_retry, monkeypatch):
+    """A zero delay bound never permits an immediate retry burst."""
+    monkeypatch.setattr(_wiki, "WIKI_REFINE_LLM_RETRY_BASE_DELAY", base_delay)
+    monkeypatch.setattr(_wiki, "WIKI_REFINE_LLM_RETRY_MAX_DELAY", max_delay)
+    model = MockChatModel()
+    model.async_chat = AsyncMock(side_effect=TimeoutError())
+    with pytest.raises(TimeoutError):
+        await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page")
+    assert model.async_chat.await_count == 1
+    page_writer_retry.assert_not_awaited()
+
+
+@pytest.mark.parametrize("typed_status", [True, False])
+async def test_page_writer_recovers_529_overload(typed_status, page_writer_retry):
+    """Recover both typed HTTP overload errors and flattened provider responses."""
+    error = RuntimeError("HTTP 529 overloaded_error")
+    if typed_status:
+        error.status_code = 529
+    model = MockChatModel()
+    model.async_chat = AsyncMock(side_effect=[error, "Recovered"])
+    assert await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page") == "Recovered"
+    assert model.async_chat.await_count == 2
+    page_writer_retry.assert_awaited_once()
+
+
+@pytest.mark.parametrize("header_name", ["retry-after", "RETRY-AFTER", "ReTrY-AfTeR"])
+async def test_page_writer_honors_case_insensitive_retry_after(header_name, page_writer_retry):
+    """Plain dictionary headers still honor the server's full reset delay."""
+    error = RuntimeError("429 rate limit")
+    error.response = SimpleNamespace(headers={header_name: "120"})
+    model = MockChatModel()
+    model.async_chat = AsyncMock(side_effect=[error, "Recovered"])
+    assert await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page") == "Recovered"
+    page_writer_retry.assert_awaited_once_with(120)
+    assert model.async_chat.await_count == 2
+
+
+@pytest.mark.parametrize("status_source", ["exception", "response"])
+@pytest.mark.parametrize("retry_after, expected_delay", [("90", 90), (None, 37.5)])
+async def test_page_writer_recovers_temporary_quota_limits(status_source, retry_after, expected_delay, page_writer_retry):
+    """Quota wording must not mask a preserved HTTP 429 or its reset delay."""
+    error = RuntimeError("Request quota exceeded")
+    error.response = SimpleNamespace(headers={} if retry_after is None else {"Retry-After": retry_after})
+    if status_source == "exception":
+        error.status_code = 429
+    else:
+        error.response.status_code = 429
+    model = MockChatModel()
+    model.async_chat = AsyncMock(side_effect=[error, "Recovered"])
+
+    assert await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page") == "Recovered"
+    assert model.async_chat.await_count == 2
+    page_writer_retry.assert_awaited_once_with(expected_delay)
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "Error code: 429 - per-minute quota exceeded",
+        "HTTP/1.1 429 - request quota exceeded",
+        "HTTP status 429 - request quota exceeded",
+        "status=429 - request quota exceeded",
+        "{'status_code': 429, 'message': 'quota exceeded'}",
+        "{'error': {'code': 'rate_limit_exceeded', 'message': 'quota exceeded'}}",
+        "HTTP 503 - capacity temporarily unavailable",
+        "HTTP 429 - credit request quota per minute exceeded",
+        "HTTP 429 - balance of request quota exhausted for this minute",
+        "HTTP 429 - 每分钟请求额度已用尽",
+    ],
+)
+async def test_page_writer_recovers_flattened_temporary_quota_errors(detail, page_writer_retry):
+    """Client-generated ERROR_QUOTA is not proof of a permanent provider error."""
+    model = MockChatModel()
+    model.async_chat = AsyncMock(side_effect=[f"**ERROR**: ERROR_QUOTA - {detail}", "Recovered"])
+
+    assert await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page") == "Recovered"
+    assert model.async_chat.await_count == 2
+    page_writer_retry.assert_awaited_once_with(37.5)
+
+
+@pytest.mark.parametrize(
+    "message, fields",
+    [
+        ("insufficient_quota", {}),
+        ("billing limit reached", {}),
+        ("insufficient credit", {}),
+        ("credit balance is too low", {}),
+        ("账户余额不足", {}),
+        ("账户额度不足", {}),
+        ("账户欠费", {}),
+        ("Request rejected", {"code": "insufficient_quota"}),
+        ("Request rejected", {"body": {"error": {"code": "insufficient_quota"}}}),
+        ("Request rejected", {"body": {"type": "insufficient_quota"}}),
+        ("invalid_api_key", {}),
+        ("invalid_request_error", {}),
+    ],
+)
+async def test_page_writer_rejects_permanent_quota_even_with_retry_after(message, fields, page_writer_retry):
+    """Explicit permanent details override a 429 and a valid reset header."""
+    error = RuntimeError(message)
+    error.status_code = 429
+    error.response = SimpleNamespace(headers={"Retry-After": "90"})
+    for name, value in fields.items():
+        setattr(error, name, value)
+    model = MockChatModel()
+    model.async_chat = AsyncMock(side_effect=[error, "Unexpected retry"])
+
+    with pytest.raises(RuntimeError, match=re.escape(message)):
+        await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page")
+    assert model.async_chat.await_count == 1
+    page_writer_retry.assert_not_awaited()
+
+
+@pytest.mark.parametrize("message", ["quota exceeded", "**ERROR**: ERROR_QUOTA - quota exceeded", "**ERROR**: ERROR_QUOTA - capacity exceeded"])
+async def test_page_writer_rejects_ambiguous_quota_errors(message, page_writer_retry):
+    """A broad quota label or Retry-After alone does not establish transience."""
+    error = RuntimeError(message)
+    error.response = SimpleNamespace(headers={"Retry-After": "90"})
+    model = MockChatModel()
+    model.async_chat = AsyncMock(side_effect=[error, "Unexpected retry"])
+
+    with pytest.raises(RuntimeError, match=re.escape(message)):
+        await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page")
+    assert model.async_chat.await_count == 1
+    page_writer_retry.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "detail, retryable",
+    [
+        ("request count 429 exceeded", False),
+        ("503 requests consumed", False),
+        ("quota: 429 requests", False),
+        ("request count 400; rate limit reached", True),
+        ("request quota 400 exceeded; Error code: 429", True),
+    ],
+)
+async def test_page_writer_does_not_treat_request_counts_as_http_status(detail, retryable, page_writer_retry):
+    """Only explicit HTTP status formats may override the remaining evidence."""
+    model = MockChatModel()
+    model.async_chat = AsyncMock(side_effect=[f"**ERROR**: ERROR_MAX_RETRIES - {detail}", "Recovered"])
+
+    if retryable:
+        assert await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page") == "Recovered"
+        assert model.async_chat.await_count == 2
+        page_writer_retry.assert_awaited_once_with(37.5)
+    else:
+        with pytest.raises(RuntimeError, match="Wiki LLM call failed"):
+            await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page")
+        assert model.async_chat.await_count == 1
+        page_writer_retry.assert_not_awaited()
+
+
+@pytest.mark.parametrize("status, retryable", [(429, True), (401, False)])
+async def test_page_writer_prefers_structured_http_status(status, retryable, page_writer_retry):
+    """An actual response status takes precedence over status-like message text."""
+    error = RuntimeError(f"HTTP {401 if retryable else 429} - rate limit")
+    error.status_code = status
+    model = MockChatModel()
+    model.async_chat = AsyncMock(side_effect=[error, "Recovered"])
+
+    if retryable:
+        assert await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page") == "Recovered"
+        assert model.async_chat.await_count == 2
+        page_writer_retry.assert_awaited_once_with(37.5)
+    else:
+        with pytest.raises(RuntimeError):
+            await _wiki._wiki_ask_page_writer(model, "system", "user", page_id="page")
+        assert model.async_chat.await_count == 1
+        page_writer_retry.assert_not_awaited()
+
+
+def test_refine_failure_entity_names_handles_new_page_entry():
+    """`existing_page` is an explicit None for pages the run creates.
+
+    Regression: the REFINE failure handler read
+    ``entry.get("existing_page", {}).get("entity_names_kwd")``, which raises
+    ``AttributeError: 'NoneType' object has no attribute 'get'`` and aborted the
+    whole build after a single page-level failure.
+    """
+    entry = {"existing_page": None, "page_title": "《水浒传》一百单八将"}
+    assert _wiki._wiki_refine_failure_entity_names(entry, "entity/朱富") == ["《水浒传》一百单八将"]
+
+
+def test_refine_failure_entity_names_prefers_existing_page_names():
+    entry = {"existing_page": {"entity_names_kwd": ["李逵", "戴宗"]}, "page_title": "unused"}
+    assert _wiki._wiki_refine_failure_entity_names(entry, "entity/x") == ["李逵", "戴宗"]
+
+
+def test_refine_failure_entity_names_normalizes_scalar_value():
+    entry = {"existing_page": {"entity_names_kwd": "李逵"}}
+    assert _wiki._wiki_refine_failure_entity_names(entry, "entity/x") == ["李逵"]
+
+
+def test_refine_failure_entity_names_falls_back_to_page_id():
+    assert _wiki._wiki_refine_failure_entity_names({}, "entity/x") == ["entity/x"]

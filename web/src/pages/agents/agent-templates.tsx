@@ -8,6 +8,10 @@ import { IFlowTemplate } from '@/interfaces/database/agent';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { CreateAgentDialog } from './create-agent-dialog';
 import { TemplateCard } from './template-card';
+import {
+  bindUnboundRetrieval,
+  collectUnboundRetrievalBindings,
+} from './template-retrieval-binding';
 import { MenuItemKey, SideBar } from './template-sidebar';
 
 export default function AgentTemplates() {
@@ -44,10 +48,26 @@ export default function AgentTemplates() {
     async (payload: any) => {
       const dsl = template?.dsl;
       const canvasCategory = template?.canvas_category;
+      const memoryIds: string[] = payload?.memory_ids ?? [];
+      const datasetBlocks = collectUnboundRetrievalBindings(dsl).datasetBlocks;
+      const datasetBindings = Object.fromEntries(
+        datasetBlocks.map((block, index) => [
+          block.blockId,
+          datasetBlocks.length === 1
+            ? (payload?.dataset_ids ?? [])
+            : (payload?.dataset_bindings?.[index] ?? []),
+        ]),
+      );
+      const boundDsl =
+        dsl &&
+        (Object.values(datasetBindings).some((ids) => ids.length > 0) ||
+          memoryIds.length > 0)
+          ? bindUnboundRetrieval(dsl, datasetBindings, memoryIds)
+          : dsl;
 
       const ret = await setAgent({
         title: payload.name,
-        dsl,
+        dsl: boundDsl,
         avatar: template?.avatar,
         canvas_category: canvasCategory,
       });
@@ -117,6 +137,7 @@ export default function AgentTemplates() {
               visible={creatingVisible}
               hideModal={hideCreatingModal}
               canvasCategory={template?.canvas_category as AgentCategory}
+              template={template}
               onOk={handleOk}
             ></CreateAgentDialog>
           )}

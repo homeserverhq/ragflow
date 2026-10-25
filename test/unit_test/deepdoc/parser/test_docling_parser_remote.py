@@ -380,42 +380,53 @@ def _fake_docling_json():
         },
         "texts": [
             {
-                "self_ref": "#/texts/0", "label": "section_header", "parent": {"$ref": "#/body"},
+                "self_ref": "#/texts/0",
+                "label": "section_header",
+                "parent": {"$ref": "#/body"},
                 "text": "Title",
                 "prov": [{"page_no": 1, "bbox": {"l": 63.595, "t": 693.014878, "r": 548.410483, "b": 680.1176442, "coord_origin": "BOTTOMLEFT"}}],
             },
             {
-                "self_ref": "#/texts/1", "label": "text", "parent": {"$ref": "#/body"},
+                "self_ref": "#/texts/1",
+                "label": "text",
+                "parent": {"$ref": "#/body"},
                 "text": "A body paragraph.",
                 "prov": [{"page_no": 1, "bbox": {"l": 63.6, "t": 656.0, "r": 548.4, "b": 640.0, "coord_origin": "BOTTOMLEFT"}}],
             },
             {
-                "self_ref": "#/texts/2", "label": "list_item",
+                "self_ref": "#/texts/2",
+                "label": "list_item",
                 "text": "- item",
                 "prov": [{"page_no": 1, "bbox": {"l": 63.6, "t": 620.0, "r": 300.0, "b": 610.0, "coord_origin": "BOTTOMLEFT"}}],
             },
             {
-                "self_ref": "#/texts/3", "label": "formula",
+                "self_ref": "#/texts/3",
+                "label": "formula",
                 "text": "E=mc^2",
                 "prov": [{"page_no": 1, "bbox": {"l": 63.6, "t": 600.0, "r": 200.0, "b": 590.0, "coord_origin": "BOTTOMLEFT"}}],
             },
             {
-                "self_ref": "#/texts/4", "label": "text", "parent": {"$ref": "#/not-body"},
+                "self_ref": "#/texts/4",
+                "label": "text",
+                "parent": {"$ref": "#/not-body"},
                 "text": "Ignored, not a body text.",
                 "prov": [{"page_no": 1, "bbox": {"l": 0.0, "t": 0.0, "r": 10.0, "b": 10.0, "coord_origin": "BOTTOMLEFT"}}],
             },
             {
-                "self_ref": "#/texts/5", "label": "caption",
+                "self_ref": "#/texts/5",
+                "label": "caption",
                 "text": "Figure: overview",
                 "prov": [{"page_no": 1, "bbox": {"l": 10.0, "t": 10.0, "r": 20.0, "b": 20.0, "coord_origin": "BOTTOMLEFT"}}],
             },
         ],
         "tables": [
             {
-                "self_ref": "#/tables/0", "label": "table",
+                "self_ref": "#/tables/0",
+                "label": "table",
                 "prov": [{"page_no": 5, "bbox": {"l": 155.5, "t": 717.4, "r": 456.4, "b": 637.4, "coord_origin": "BOTTOMLEFT"}}],
                 "data": {
-                    "num_rows": 2, "num_cols": 2,
+                    "num_rows": 2,
+                    "num_cols": 2,
                     "table_cells": [
                         {"text": "Asset", "start_row_offset_idx": 0, "end_row_offset_idx": 1, "start_col_offset_idx": 0, "end_col_offset_idx": 1, "column_header": True},
                         {"text": "Version", "start_row_offset_idx": 0, "end_row_offset_idx": 1, "start_col_offset_idx": 1, "end_col_offset_idx": 2, "column_header": True},
@@ -427,7 +438,8 @@ def _fake_docling_json():
         ],
         "pictures": [
             {
-                "self_ref": "#/pictures/0", "label": "picture",
+                "self_ref": "#/pictures/0",
+                "label": "picture",
                 "prov": [{"page_no": 1, "bbox": {"l": 92.1, "t": 737.1, "r": 514.7, "b": 538.6, "coord_origin": "BOTTOMLEFT"}}],
                 "captions": [{"$ref": "#/texts/5"}],
             }
@@ -645,25 +657,30 @@ def _picture_description_json():
         "pages": {"1": {"size": {"width": 612.0, "height": 792.0}}},
         "texts": [
             {
-                "self_ref": "#/texts/0", "label": "text", "parent": {"$ref": "#/body"},
+                "self_ref": "#/texts/0",
+                "label": "text",
+                "parent": {"$ref": "#/body"},
                 "text": "A body paragraph.",
                 "prov": [{"page_no": 1, "bbox": {"l": 63.6, "t": 656.0, "r": 548.4, "b": 640.0, "coord_origin": "BOTTOMLEFT"}}],
             },
         ],
         "pictures": [
             {
-                "self_ref": "#/pictures/0", "label": "picture",
+                "self_ref": "#/pictures/0",
+                "label": "picture",
                 "prov": [{"page_no": 1, "bbox": {"l": 92.1, "t": 737.1, "r": 514.7, "b": 538.6, "coord_origin": "BOTTOMLEFT"}}],
                 "meta": {"description": {"text": "Image Description (g34b): a car"}},
             },
             {
-                "self_ref": "#/pictures/1", "label": "picture",
+                "self_ref": "#/pictures/1",
+                "label": "picture",
                 "prov": [{"page_no": 1, "bbox": {"l": 100.0, "t": 400.0, "r": 200.0, "b": 300.0, "coord_origin": "BOTTOMLEFT"}}],
                 "meta": {"description": {"text": "   "}},
                 "annotations": [{"kind": "description", "text": "Image Description (g34b): a diagram"}],
             },
             {
-                "self_ref": "#/pictures/2", "label": "picture",
+                "self_ref": "#/pictures/2",
+                "label": "picture",
                 "prov": [{"page_no": 1, "bbox": {"l": 300.0, "t": 500.0, "r": 400.0, "b": 400.0, "coord_origin": "BOTTOMLEFT"}}],
                 "meta": {},
             },
@@ -694,7 +711,8 @@ def test_json_to_tables_pairs_description_with_caption(monkeypatch):
     # give the first picture a caption ref so the pairing is exercised
     doc["pictures"][0]["captions"] = [{"$ref": "#/texts/4"}]
     caption_item = {
-        "self_ref": "#/texts/4", "label": "caption",
+        "self_ref": "#/texts/4",
+        "label": "caption",
         "text": "Figure X: a shiny car",
         "prov": [{"page_no": 1, "bbox": {"l": 92.1, "t": 730.0, "r": 514.7, "b": 700.0, "coord_origin": "BOTTOMLEFT"}}],
     }
@@ -722,7 +740,8 @@ def test_json_to_tables_description_without_caption_is_not_dropped(monkeypatch):
     parser = module.DoclingParser()
     doc = _picture_description_json()
     doc["pictures"][2] = {
-        "self_ref": "#/pictures/2", "label": "picture",
+        "self_ref": "#/pictures/2",
+        "label": "picture",
         "prov": [{"page_no": 1, "bbox": {"l": 300.0, "t": 500.0, "r": 400.0, "b": 400.0, "coord_origin": "BOTTOMLEFT"}}],
         "meta": {"description": {"text": "Image Description (g34b): a lonely chart"}},
     }
@@ -741,47 +760,61 @@ def _body_tree_json():
         "pages": {"1": {"size": {"width": 612.0, "height": 792.0}}},
         "texts": [
             {
-                "self_ref": "#/texts/0", "label": "text", "parent": {"$ref": "#/body"},
+                "self_ref": "#/texts/0",
+                "label": "text",
+                "parent": {"$ref": "#/body"},
                 "text": "Intro paragraph.",
                 "prov": [{"page_no": 1, "bbox": {"l": 63.6, "t": 656.0, "r": 548.4, "b": 640.0, "coord_origin": "BOTTOMLEFT"}}],
             },
             {
-                "self_ref": "#/texts/1", "label": "text", "parent": {"$ref": "#/body"},
+                "self_ref": "#/texts/1",
+                "label": "text",
+                "parent": {"$ref": "#/body"},
                 "text": "Middle paragraph.",
                 "prov": [{"page_no": 1, "bbox": {"l": 63.6, "t": 500.0, "r": 548.4, "b": 484.0, "coord_origin": "BOTTOMLEFT"}}],
             },
             {
-                "self_ref": "#/texts/2", "label": "list_item", "parent": {"$ref": "#/groups/0"},
+                "self_ref": "#/texts/2",
+                "label": "list_item",
+                "parent": {"$ref": "#/groups/0"},
                 "text": "- list item",
                 "prov": [{"page_no": 1, "bbox": {"l": 63.6, "t": 300.0, "r": 300.0, "b": 292.0, "coord_origin": "BOTTOMLEFT"}}],
             },
             {
-                "self_ref": "#/texts/3", "label": "text", "parent": {"$ref": "#/body"},
+                "self_ref": "#/texts/3",
+                "label": "text",
+                "parent": {"$ref": "#/body"},
                 "text": "Closing paragraph.",
                 "prov": [{"page_no": 1, "bbox": {"l": 63.6, "t": 100.0, "r": 548.4, "b": 84.0, "coord_origin": "BOTTOMLEFT"}}],
             },
         ],
         "groups": [
             {
-                "self_ref": "#/groups/0", "label": "list", "subtype": "list",
+                "self_ref": "#/groups/0",
+                "label": "list",
+                "subtype": "list",
                 "parent": {"$ref": "#/body"},
                 "children": [{"$ref": "#/texts/2"}],
             },
         ],
         "pictures": [
             {
-                "self_ref": "#/pictures/0", "label": "picture",
+                "self_ref": "#/pictures/0",
+                "label": "picture",
                 "prov": [{"page_no": 1, "bbox": {"l": 92.1, "t": 600.0, "r": 514.7, "b": 501.6, "coord_origin": "BOTTOMLEFT"}}],
                 "meta": {"description": {"text": "Image Description (g34b): a car"}},
             },
             {
-                "self_ref": "#/pictures/1", "label": "picture",
+                "self_ref": "#/pictures/1",
+                "label": "picture",
                 "prov": [{"page_no": 1, "bbox": {"l": 92.1, "t": 200.0, "r": 514.7, "b": 101.6, "coord_origin": "BOTTOMLEFT"}}],
                 "meta": {"description": {"text": "Image Description (g34b): a diagram"}},
             },
         ],
         "body": {
-            "self_ref": "#/body", "parent": None, "label": "body",
+            "self_ref": "#/body",
+            "parent": None,
+            "label": "body",
             "children": [
                 {"$ref": "#/texts/0"},
                 {"$ref": "#/pictures/0"},

@@ -13,11 +13,13 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+import copy
 import sys
 import types
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+
 from common.doc_store.doc_store_base import FusionExpr, MatchDenseExpr, MatchTextExpr
 
 
@@ -88,12 +90,13 @@ def dealer_cls():
         DOC_ENGINE_INFINITY=False,
         DOC_ENGINE_OCEANBASE=False,
         DOC_ENGINE_SERENEDB=False,
+        DOC_ENGINE_VASTBASE=False,
     )
     if common_module is not None:
-        setattr(common_module, "settings", settings_stub)
+        common_module.settings = settings_stub
     token_utils_stub = _install_module("common.token_utils", num_tokens_from_string=lambda value: len(str(value).split()))
     if common_module is not None:
-        setattr(common_module, "token_utils", token_utils_stub)
+        common_module.token_utils = token_utils_stub
 
     _install_module("roman_numbers")
     _install_module("word2number", w2n=types.SimpleNamespace(word_to_num=lambda value: 0))
@@ -125,7 +128,7 @@ def dealer_cls():
     memory_utils.__path__ = []
     sys.modules["memory.utils"] = memory_utils
     if memory_module is not None:
-        setattr(memory_module, "utils", memory_utils)
+        memory_module.utils = memory_utils
     for short_name in ("es_conn", "infinity_conn", "ob_conn"):
         module = _install_module(
             f"memory.utils.{short_name}",
@@ -156,18 +159,18 @@ def dealer_cls():
                 if hasattr(common_module, "settings"):
                     delattr(common_module, "settings")
             else:
-                setattr(common_module, "settings", saved_common_settings)
+                common_module.settings = saved_common_settings
             if saved_common_token_utils is None:
                 if hasattr(common_module, "token_utils"):
                     delattr(common_module, "token_utils")
             else:
-                setattr(common_module, "token_utils", saved_common_token_utils)
+                common_module.token_utils = saved_common_token_utils
         if memory_module is not None:
             if saved_memory_utils is None:
                 if hasattr(memory_module, "utils"):
                     delattr(memory_module, "utils")
             else:
-                setattr(memory_module, "utils", saved_memory_utils)
+                memory_module.utils = saved_memory_utils
 
 
 def make_dealer(dealer_cls):
@@ -206,6 +209,154 @@ class FakeGaussDBStore:
 class FakeQueryer:
     def question(self, text, min_match=0.3):
         return MatchTextExpr(["content_with_weight"], text, 1024), [text]
+
+
+class RetryStore(FakeGaussDBStore):
+    def __init__(self, totals, mutate=False):
+        self.totals = iter(totals)
+        self.calls = []
+        self.mutate = mutate
+
+    def search(self, *args, **kwargs):
+        self.calls.append(copy.deepcopy((args, kwargs)))
+        if self.mutate:
+            dense = next((expr for expr in args[3] if isinstance(expr, MatchDenseExpr)), None)
+            if dense:
+                dense.extra_options.pop("num_candidates", None)
+                dense.extra_options["filter"] = "connector-added"
+        return type("SearchResult", (), {"total": next(self.totals), "chunks": []})()
+
+
+async def run_retry_search(dealer_cls, totals, *, queryer=None, mutate=False, doc_ids=None):
+    dealer = make_dealer(dealer_cls)
+    dealer.qryr = queryer or FakeQueryer()
+    dealer.dataStore = RetryStore(totals, mutate)
+
+    async def fake_get_vector(_text, _emb_mdl, top_k=10, num_candidates=20, similarity=0.1):
+        return MatchDenseExpr(
+            "q_4_vec",
+            [0.1, 0.2, 0.3, 0.4],
+            "float",
+            "cosine",
+            top_k,
+            {"similarity": similarity, "num_candidates": num_candidates, "future_option": "kept"},
+        )
+
+    dealer.get_vector = fake_get_vector
+    req = {
+        "question": "ปัญหาแจ้งระบบภาษี",
+        "page": 1,
+        "size": 5,
+        "kb_ids": ["kb1"],
+        "available_int": 1,
+        "must_not": {"exists": "compile_kwd"},
+        "knn_top_k": 7,
+        "knn_num_candidates": 19,
+    }
+    if doc_ids:
+        req["doc_ids"] = doc_ids
+    await dealer.search(req, "ragflow_tenant", ["kb1"], emb_mdl=object(), highlight=True)
+    return dealer.dataStore.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("totals", "expected_calls", "final_expression_count"),
+    [([1], 1, 3), ([0, 1], 2, 3), ([0, 0, 1], 3, 1), ([0, 0, 0], 3, 1)],
+    ids=["one-weak-lexical-hit", "relaxed-hit", "dense-recovery", "dense-recovery-empty"],
+)
+async def test_dense_fallback_runs_only_after_empty_hybrid_attempts(dealer_cls, totals, expected_calls, final_expression_count):
+    calls = await run_retry_search(dealer_cls, totals)
+
+    assert len(calls) == expected_calls
+    assert len(calls[-1][0][3]) == final_expression_count
+    if expected_calls == 3:
+        args, kwargs = calls[-1]
+        dense = args[3][0]
+        assert args[1] == []
+        assert args[2] == {"kb_id": ["kb1"], "available_int": 1, "must_not": {"exists": "compile_kwd"}}
+        assert args[8] == ["kb1"]
+        assert kwargs == {"rank_feature": None}
+        assert dense.topn == 7
+        assert dense.extra_options == {"similarity": 0.17, "num_candidates": 19, "future_option": "kept"}
+
+
+@pytest.mark.asyncio
+async def test_dense_fallback_uses_pristine_expression(dealer_cls):
+    calls = await run_retry_search(dealer_cls, [0, 0, 1], mutate=True)
+
+    for index, (args, _) in enumerate(calls):
+        dense = next(expr for expr in args[3] if isinstance(expr, MatchDenseExpr))
+        assert dense.extra_options == {
+            "similarity": 0.1 if index == 0 else 0.17,
+            "num_candidates": 19,
+            "future_option": "kept",
+        }
+
+
+@pytest.mark.asyncio
+async def test_no_lexical_expression_stays_single_dense_search(dealer_cls):
+    calls = await run_retry_search(dealer_cls, [0, 0], queryer=types.SimpleNamespace(question=lambda *_args, **_kwargs: (None, [])))
+
+    assert len(calls) == 2
+    assert len(calls[-1][0][3]) == 1
+    assert isinstance(calls[-1][0][3][0], MatchDenseExpr)
+    assert calls[-1][0][3][0].extra_options["similarity"] == 0.17
+
+
+@pytest.mark.asyncio
+async def test_dense_only_fallback_can_be_disabled(dealer_cls):
+    dealer = make_dealer(dealer_cls)
+    dealer.qryr = types.SimpleNamespace(question=lambda *_args, **_kwargs: (None, []))
+    dealer.dataStore = RetryStore([0])
+
+    async def fake_get_vector(_text, _emb_mdl, top_k=10, num_candidates=20, similarity=0.1):
+        return MatchDenseExpr("q_4_vec", [0.1, 0.2, 0.3, 0.4], "float", "cosine", top_k, {"similarity": similarity, "num_candidates": num_candidates})
+
+    dealer.get_vector = fake_get_vector
+    await dealer.search(
+        {"question": "query", "page": 1, "size": 5, "kb_ids": ["kb1"], "allow_dense_fallback": False},
+        "ragflow_tenant",
+        ["kb1"],
+        emb_mdl=object(),
+    )
+
+    assert len(dealer.dataStore.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_document_scope_retries_with_scored_legs_not_filter_only(dealer_cls):
+    """A document scope that matched nothing keeps the document filter and
+    retries with scored legs instead of dropping every MATCH expression.
+
+    A filter-only query cannot carry a score on Infinity (it rejects the score
+    column, error 3013), so its rows read back as 0.0 across the board — the
+    "all scores collapsed" signature of infiniflow/infinity#3523, which is
+    indistinguishable from a real retrieval failure and has already masked one.
+    """
+    calls = await run_retry_search(dealer_cls, [0, 1], doc_ids=["doc-1"])
+
+    assert len(calls) == 2
+    assert calls[1][0][2]["doc_id"] == ["doc-1"]
+    assert len(calls[1][0][3]) == 3
+    assert all(len(args[3]) > 0 for args, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_document_scope_returns_empty_instead_of_filter_only_scan(dealer_cls):
+    """When even the scored retries miss, the document scope returns empty
+    rather than scanning the document with no MATCH expression: the chunks are
+    there, they simply cannot say how relevant they are.
+
+    Callers that want a document's chunks regardless of relevance use the
+    chunk-list API, not retrieval.
+    """
+    calls = await run_retry_search(dealer_cls, [0, 0, 0], doc_ids=["doc-1"])
+
+    assert len(calls) == 3
+    assert len(calls[-1][0][3]) == 1
+    assert isinstance(calls[-1][0][3][0], MatchDenseExpr)
+    assert all(len(args[3]) > 0 for args, _ in calls)
 
 
 def retrieval_chunk(score, doc_id, doc_name, content="risk contract"):
@@ -488,6 +639,7 @@ async def test_tc_ret_311_retrieval_keeps_term_only_gaussdb_scores_when_vector_w
             total=2,
             ids=["term-low", "term-zero"],
             query_vector=[0.1, 0.2],
+            highlight={},
             field={
                 "term-low": retrieval_chunk(0.1, "doc-low", "Low"),
                 "term-zero": retrieval_chunk(0.0, "doc-zero", "Zero"),

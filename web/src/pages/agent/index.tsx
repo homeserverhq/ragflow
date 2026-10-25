@@ -43,16 +43,17 @@ import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router';
 import AgentCanvas from './canvas';
 import { DropdownProvider } from './canvas/context';
+import { CanvasChecklist } from './components/canvas-checklist';
 import { PublishConfirmDialog } from './components/publish-confirm-dialog';
 import { Operator } from './constant';
 import { OwnerTenantIdContext } from './context';
 import { GlobalParamSheet } from './gobal-variable-sheet';
 import { useBuildDslData } from './hooks/use-build-dsl';
 import { useCancelCurrentDataflow } from './hooks/use-cancel-dataflow';
+import { useCanvasChecklist } from './hooks/use-canvas-checklist';
 import { useHandleExportJsonFile } from './hooks/use-export-json';
 import { useFetchDataOnMount } from './hooks/use-fetch-data';
 import { useFetchPipelineLog } from './hooks/use-fetch-pipeline-log';
-import { useGetBeginNodeDataInputs } from './hooks/use-get-begin-query';
 import { useIsPipeline } from './hooks/use-is-pipeline';
 import {
   useIsConversationMode,
@@ -62,7 +63,6 @@ import { useRunDataflow } from './hooks/use-run-dataflow';
 import {
   useSaveGraph,
   useSaveGraphBeforeOpeningDebugDrawer,
-  useValidateNodeForms,
   useWatchAgentChange,
 } from './hooks/use-save-graph';
 import { PipelineLogSheet } from './pipeline-log-sheet';
@@ -106,24 +106,25 @@ export default function Agent() {
 
   const { handleExportJson } = useHandleExportJsonFile();
   const { saveGraph, loading } = useSaveGraph();
-  const { notifyIfInvalid } = useValidateNodeForms();
+  // Saving is always allowed — the canvas checklist flags issues and gates
+  // only the publish/run/embed/explore entry points.
   const handleSave = useCallback(() => {
-    if (notifyIfInvalid()) {
-      saveGraph();
-    }
-  }, [notifyIfInvalid, saveGraph]);
+    saveGraph();
+  }, [saveGraph]);
   const { flowDetail: agentDetail } = useFetchDataOnMount();
+  const { issues, getLatestIssues } = useCanvasChecklist({
+    ownerTenantId: agentDetail?.user_id,
+  });
+  const hasBlockingIssues = useCallback(() => {
+    if (getLatestIssues().length > 0) {
+      message.warning(t('flow.checklistResolveBefore'));
+      return true;
+    }
+    return false;
+  }, [getLatestIssues, t]);
   const { buildDslData } = useBuildDslData();
   const { setAgent, loading: savingWidgetSettings } = useSetAgent(false);
-  const inputs = useGetBeginNodeDataInputs();
   const { handleRun } = useSaveGraphBeforeOpeningDebugDrawer(showChatDrawer);
-  const handleRunAgent = useCallback(() => {
-    if (inputs.length > 0) {
-      showChatDrawer();
-    } else {
-      handleRun();
-    }
-  }, [handleRun, inputs, showChatDrawer]);
   const {
     visible: versionDialogVisible,
     hideModal: hideVersionDialog,
@@ -210,23 +211,53 @@ export default function Agent() {
     stopFetchTrace,
   });
 
-  const handleButtonRunClick = useCallback(() => {
+  const handleButtonRunClick = useCallback(async () => {
+    if (hasBlockingIssues()) {
+      return;
+    }
     if (isWebhookMode) {
-      saveGraph();
-      showWebhookTestSheet();
+      if ((await saveGraph())?.code === 0) showWebhookTestSheet();
     } else if (isPipeline) {
       handleRunPipeline();
     } else {
-      handleRunAgent();
+      handleRun();
     }
   }, [
-    handleRunAgent,
+    hasBlockingIssues,
+    handleRun,
     handleRunPipeline,
     isPipeline,
     isWebhookMode,
     saveGraph,
     showWebhookTestSheet,
   ]);
+
+  const handleExploreClick = useCallback(() => {
+    if (hasBlockingIssues()) {
+      return;
+    }
+    navigateToAgentExplore(id as string)();
+  }, [hasBlockingIssues, id, navigateToAgentExplore]);
+
+  const handleEmbedClick = useCallback(() => {
+    if (hasBlockingIssues()) {
+      return;
+    }
+    showEmbedModal();
+  }, [hasBlockingIssues, showEmbedModal]);
+
+  // Single source for the Run button so the tooltip gating in the JSX below
+  // doesn't duplicate it.
+  const runButton = (
+    <Button
+      data-testid="agent-run"
+      variant={'secondary'}
+      onClick={handleButtonRunClick}
+    >
+      <CirclePlay />
+      {t('flow.run')}
+    </Button>
+  );
 
   const {
     run: runPipeline,
@@ -294,19 +325,9 @@ export default function Agent() {
           >
             <LaptopMinimalCheck /> {t('flow.save')}
           </ButtonLoading>
-          <Button
-            data-testid="agent-run"
-            variant={'secondary'}
-            onClick={handleButtonRunClick}
-          >
-            <CirclePlay />
-            {t('flow.run')}
-          </Button>
+          {!isPipeline && runButton}
           {isConversationMode && (
-            <Button
-              variant={'secondary'}
-              onClick={navigateToAgentExplore(id as string)}
-            >
+            <Button variant={'secondary'} onClick={handleExploreClick}>
               <Compass />
               {t('explore.title')}
             </Button>
@@ -315,7 +336,9 @@ export default function Agent() {
             agentDetail={agentDetail}
             loading={loading}
             onPublish={() => saveGraph(undefined, undefined, true)}
+            onBeforeOpen={hasBlockingIssues}
           />
+          <CanvasChecklist issues={issues} />
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button variant={'secondary'}>
@@ -355,7 +378,7 @@ export default function Agent() {
                 (location.hostname !== 'cloud.ragflow.io' && (
                   <>
                     <DropdownMenuSeparator />
-                    <AgentDropdownMenuItem onClick={showEmbedModal}>
+                    <AgentDropdownMenuItem onClick={handleEmbedClick}>
                       <ScreenShare />
                       {t('common.embedIntoSite')}
                     </AgentDropdownMenuItem>

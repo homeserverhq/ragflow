@@ -21,7 +21,8 @@ import random
 import re
 import time
 from abc import abstractmethod
-from typing import Callable, TypeVar
+from collections.abc import Callable
+from typing import TypeVar
 
 import infinity
 import pandas as pd
@@ -32,7 +33,6 @@ from infinity.index import IndexInfo, IndexType
 from common import settings
 from common.doc_store.doc_store_base import DocStoreConnection, MatchExpr, OrderByExpr
 from common.file_utils import get_project_base_directory
-from rag.nlp import is_english
 
 # Concurrent CREATE/DROP TABLE on the same Infinity instance can race on
 # Infinity's RocksDB-backed catalog counters (e.g. ``db|1|next_table_id``).
@@ -164,6 +164,25 @@ def _retry_on_meta_contention(
     )
     assert last_exc is not None
     raise last_exc
+
+
+def _flatten_filter_values(values: list) -> list:
+    """Unwrap containers inside a filter value list, keeping scalar entries.
+
+    A caller may re-wrap a ``*_kwd`` value that ``get_fields`` already returned
+    as a list. Interpolating the nested container emits ``k=['x']``, which
+    Infinity rejects with 3030 — and dropping the entry silently would leave
+    rows behind on delete.
+    """
+    if not any(isinstance(item, (list, tuple, set)) for item in values):
+        return values
+    flattened = []
+    for item in values:
+        if isinstance(item, (list, tuple, set)):
+            flattened.extend(item)
+        else:
+            flattened.append(item)
+    return flattened
 
 
 class InfinityConnectionBase(DocStoreConnection):
@@ -307,6 +326,11 @@ class InfinityConnectionBase(DocStoreConnection):
         return sep.join(lst)
 
     def equivalent_condition_to_str(self, condition: dict, table_instance=None, is_delete: bool = False) -> str | None:
+        """Translate structured filters into an Infinity scalar predicate.
+
+        Existence filters compare a field with its typed schema default and
+        require the table's column metadata.
+        """
         assert "_id" not in condition
         columns = {}
         if table_instance:
@@ -314,12 +338,12 @@ class InfinityConnectionBase(DocStoreConnection):
                 columns[n] = (ty, de)
 
         def exists(cln):
+            """Compare a column with its default, quoting text and JSON values."""
             nonlocal columns
             assert cln in columns, f"'{cln}' should be in '{columns}'."
             ty, de = columns[cln]
-            if ty.lower().find("cha"):
-                if not de:
-                    de = ""
+            if "char" in ty.lower() or ty.lower() == "json":
+                de = str(de or "").replace("'", "''")
                 return f" {cln}!='{de}' "
             return f"{cln}!={de}"
 
@@ -390,21 +414,34 @@ class InfinityConnectionBase(DocStoreConnection):
                     raise ValueError(f"No valid delete predicate could be generated for column '{k}'")
             elif k in {"compile_kwd", "type_kwd", "parent_kwd"}:
                 values = v if isinstance(v, list) else [v]
+                values = _flatten_filter_values(values)
                 exact_conditions = []
                 for item in values:
                     if isinstance(item, str):
                         item = item.replace("'", "''")
                         exact_conditions.append(f"{k}='{item}'")
-                    else:
+                    elif isinstance(item, (int, float)) and not isinstance(item, bool):
                         exact_conditions.append(f"{k}={item}")
+                    elif item is not None:
+                        # A caller fed us a value that `get_fields` already
+                        # returned as a list. Interpolating the container
+                        # emits `k=['x']`, which Infinity rejects with 3030
+                        # ("array not found") — and silently dropping it would
+                        # generate a missing predicate instead. Fail loudly.
+                        raise ValueError(f"Cannot build {k} predicate from value {item!r}")
                 if exact_conditions:
                     cond.append("(" + " or ".join(exact_conditions) + ")")
             elif self.field_keyword(k):
                 if isinstance(v, list):
                     inCond = list()
-                    for item in v:
+                    for item in _flatten_filter_values(v):
                         if isinstance(item, str):
                             item = item.replace("'", "''")
+                        elif isinstance(item, (list, tuple, set)):
+                            # Unwrapping covers one level of re-wrapping; a deeper
+                            # one would interpolate as `'['x']'` inside the
+                            # fulltext call and silently stop matching.
+                            raise ValueError(f"Cannot build {k} filter from value {item!r}")
                         inCond.append(f"filter_fulltext('{self.convert_matching_field(k)}', '{item}')")
                     if inCond:
                         strInCond = " or ".join(inCond)
@@ -430,13 +467,13 @@ class InfinityConnectionBase(DocStoreConnection):
                     for kk, vv in v.items():
                         if kk == "exists":
                             cond.append("NOT (%s)" % exists(vv))
+            elif k == "exists":
+                cond.append(exists(v))
             elif isinstance(v, str):
                 escaped_v = v.replace("'", "''")
                 cond.append(f"{k}='{escaped_v}'")
-            elif k == "exists":
-                cond.append(exists(v))
             else:
-                cond.append(f"{k}={str(v)}")
+                cond.append(f"{k}={v!s}")
         return " AND ".join(cond) if cond else "1=1"
 
     @staticmethod
@@ -697,7 +734,7 @@ class InfinityConnectionBase(DocStoreConnection):
             _ = db_instance.get_table(table_name)
             return True
         except Exception as e:
-            self.logger.warning(f"INFINITY indexExist {str(e)}")
+            self.logger.warning(f"INFINITY indexExist {e!s}")
             return False
         finally:
             self.connPool.release_conn(inf_conn)
@@ -783,55 +820,23 @@ class InfinityConnectionBase(DocStoreConnection):
         raise NotImplementedError("Not implemented")
 
     def get_highlight(self, res: tuple[pd.DataFrame, int] | pd.DataFrame, keywords: list[str], field_name: str):
-        # Extract DataFrame from result
         if isinstance(res, tuple):
             df, _ = res
         else:
             df = res
 
-        if df.empty or field_name not in df.columns:
-            return {}
-
-        ans = {}
-        num_rows = len(res)
-        column_id = res["id"]
-        if field_name not in res:
-            if field_name == "content_with_weight" and "content" in res:
+        if field_name not in df:
+            if field_name == "content_with_weight" and "content" in df:
                 field_name = "content"
             else:
                 return {}
-        for i in range(num_rows):
-            id = column_id[i]
-            txt = res[field_name][i]
-            if re.search(r"<em>[^<>]+</em>", txt, flags=re.IGNORECASE | re.MULTILINE):
-                ans[id] = txt
-                continue
-            txt = re.sub(r"[\r\n]", " ", txt, flags=re.IGNORECASE | re.MULTILINE)
-            txt_list = []
-            for t in re.split(r"[.?!;\n]", txt):
-                if is_english([t]):
-                    for w in keywords:
-                        t = re.sub(
-                            r"(^|[ .?/'\"\(\)!,:;-])(%s)([ .?/'\"\(\)!,:;-])" % re.escape(w),
-                            r"\1<em>\2</em>\3",
-                            t,
-                            flags=re.IGNORECASE | re.MULTILINE,
-                        )
-                else:
-                    for w in sorted(keywords, key=len, reverse=True):
-                        t = re.sub(
-                            re.escape(w),
-                            f"<em>{w}</em>",
-                            t,
-                            flags=re.IGNORECASE | re.MULTILINE,
-                        )
-                if not re.search(r"<em>[^<>]+</em>", t, flags=re.IGNORECASE | re.MULTILINE):
-                    continue
-                txt_list.append(t)
-            if txt_list:
-                ans[id] = "...".join(txt_list)
-            else:
-                ans[id] = txt
+        if df.empty:
+            return {}
+
+        ans = {}
+        pattern = re.compile("|".join(re.escape(w) for w in sorted(filter(None, keywords), key=len, reverse=True)), re.IGNORECASE) if any(keywords) else None
+        for id, txt in zip(df["id"], df[field_name]):
+            ans[id] = pattern.sub(lambda match: f"<em>{match.group(0)}</em>", txt) if pattern else txt
         return ans
 
     def get_aggregation(self, res: tuple[pd.DataFrame, int] | pd.DataFrame, field_name: str):

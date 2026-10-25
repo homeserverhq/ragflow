@@ -12,7 +12,7 @@ import { cn } from '@/lib/utils';
 import { sanitizeHtmlWithImagesAsText } from '@/utils/dom-util';
 import { CheckedState } from '@radix-ui/react-checkbox';
 import classNames from 'classnames';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type MouseEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ChunkTextMode } from '../../constant';
 import styles from './index.module.less';
@@ -61,6 +61,10 @@ const ChunkCard = ({
     clickChunkCard(item.chunk_id);
   };
 
+  const handleControlClick = (e: MouseEvent) => {
+    e.stopPropagation();
+  };
+
   useEffect(() => {
     setEnabled(available === 1);
   }, [available]);
@@ -92,17 +96,18 @@ const ChunkCard = ({
         <Checkbox
           className="mt-1"
           onCheckedChange={handleCheck}
-          onClick={(e) => e.stopPropagation()}
+          onClick={handleControlClick}
           checked={checked}
         />
 
         {/* Using <Tooltip> instead of <Popover> to avoid flickering when hovering over the image */}
         {item.image_id && (
           <Tooltip>
-            <TooltipTrigger>
+            <TooltipTrigger onClick={handleControlClick}>
               <Image
                 t={imageCacheKey}
                 id={item.image_id}
+                documentId={item.doc_id}
                 className="mt-1 rounded !w-28 object-contain"
               />
             </TooltipTrigger>
@@ -117,6 +122,7 @@ const ChunkCard = ({
               <Image
                 t={imageCacheKey}
                 id={item.image_id}
+                documentId={item.doc_id}
                 className="size-full max-w-[50vw] max-h-[50vh] object-contain"
               />
             </TooltipContent>
@@ -138,7 +144,7 @@ const ChunkCard = ({
           />
         </section>
 
-        <div onClick={(e) => e.stopPropagation()}>
+        <div onClick={handleControlClick}>
           <Switch
             checked={enabled}
             onCheckedChange={onChange}

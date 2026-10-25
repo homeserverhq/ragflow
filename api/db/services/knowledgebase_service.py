@@ -394,11 +394,9 @@ class KnowledgebaseService(CommonService):
                 if k not in old:
                     old[k] = v
                     continue
-                if isinstance(v, dict):
-                    assert isinstance(old[k], dict)
+                if isinstance(v, dict) and isinstance(old[k], dict):
                     dfs_update(old[k], v)
-                elif isinstance(v, list):
-                    assert isinstance(old[k], list)
+                elif isinstance(v, list) and isinstance(old[k], list):
                     old[k] = list(set(old[k] + v))
                 else:
                     old[k] = v
@@ -541,7 +539,8 @@ class KnowledgebaseService(CommonService):
             kbs = kbs.order_by(cls.model.getter_by(orderby).asc())
 
         total = kbs.count()
-        kbs = kbs.paginate(page_number, items_per_page)
+        if not ids:
+            kbs = kbs.paginate(page_number, items_per_page)
 
         return list(kbs.dicts()), total
 

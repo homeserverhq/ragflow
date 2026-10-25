@@ -42,7 +42,6 @@ jobs:
     runs-on: [ "self-hosted", "ragflow-test" ]
     outputs:
       http_api_test_level: ${{ steps.test_level.outputs.http_api_test_level }}
-      has_go_changes: ${{ steps.detect_changes.outputs.has_go_changes }}
       has_python_changes: ${{ steps.detect_changes.outputs.has_python_changes }}
       has_web_changes: ${{ steps.detect_changes.outputs.has_web_changes }}
       api_proxy_schemes: ${{ steps.detect_changes.outputs.api_proxy_schemes }}
@@ -134,6 +133,13 @@ jobs:
 #            fi
 #          fi
 
+      # lefthook's web-checks hook resolves oxlint/oxfmt through
+      # tools/hooks/web_tools.sh, which needs node and npm on PATH.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Run Lefthook on changed files
         run: |
           set -euo pipefail
@@ -158,6 +164,10 @@ jobs:
             # applying --fix or `git add`, so CI only checks and reports
             # failures instead of rewriting the working tree.
             LEFTHOOK_CHECK_ONLY=1 lefthook run pre-commit --files-from-stdin --no-auto-install < "$changed_files"
+            # web-checks is a separate hook because it is not wired into local
+            # commits: it installs a Node toolchain that only CI has a reason to
+            # pay for. It is always check-only, so it needs no CHECK_ONLY flag.
+            lefthook run web-checks --files-from-stdin --no-auto-install < "$changed_files"
           fi
 
       - name: Set test level
@@ -176,12 +186,10 @@ jobs:
         id: detect_changes
         run: |
           set -euo pipefail
-          has_go=false
           has_python=false
           has_web=false
 
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            has_go=true
             has_python=true
             has_web=true
           else
@@ -199,47 +207,41 @@ jobs:
             while IFS= read -r file; do
               case "$file" in
                 # Docker, test, SDK, and workflow changes can alter either server path.
-                Dockerfile|Dockerfile_ci|docker/**|.github/workflows/**|sdk/**)
-                  has_go=true
+                # build.sh also controls the C++/native build, so it must trigger native backend.
+                Dockerfile|Dockerfile_ci|docker/**|.github/workflows/**|sdk/**|build.sh)
                   has_python=true
                   ;;
                 test/unit_test/**)
                   has_python=true
                   ;;
                 test/**)
-                  has_go=true
                   has_python=true
                   ;;
-                *.go|go.mod|go.sum|build.sh)              has_go=true ;;
                 *.py|pyproject.toml|requirements*.txt)    has_python=true ;;
                 web/*)                                    has_web=true ;;
               esac
             done <<< "$CHANGED_FILES"
 
-            if [[ "$has_go" == "false" && "$has_python" == "false" && "$has_web" == "false" ]]; then
-              has_go=true
+            if [[ "$has_python" == "false" && "$has_web" == "false" ]]; then
               has_python=true
               has_web=true
             fi
           fi
 
-          if [[ "$has_go" == "true" && "$has_python" == "true" ]]; then
-            api_proxy_schemes='["go","python"]'
-          elif [[ "$has_go" == "true" ]]; then
-            api_proxy_schemes='["go"]'
+          if [[ "$has_python" == "true" ]]; then
+            api_proxy_schemes='["python"]'
           elif [[ "$has_python" == "true" ]]; then
             api_proxy_schemes='["python"]'
           elif [[ "$has_web" == "true" ]]; then
             api_proxy_schemes='["web"]'
           else
-            api_proxy_schemes='["go","python"]'
+            api_proxy_schemes='["python"]'
           fi
 
-          echo "has_go_changes=${has_go}"        >> $GITHUB_OUTPUT
           echo "has_python_changes=${has_python}" >> $GITHUB_OUTPUT
           echo "has_web_changes=${has_web}"       >> $GITHUB_OUTPUT
           echo "api_proxy_schemes=${api_proxy_schemes}" >> $GITHUB_OUTPUT
-          echo "Go: ${has_go}, Python: ${has_python}, Web: ${has_web}, proxy schemes: ${api_proxy_schemes}"
+          echo "Python: ${has_python}, Web: ${has_web}, proxy schemes: ${api_proxy_schemes}"
 
       - name: Prepare Python test environment
         if: steps.detect_changes.outputs.has_python_changes == 'true'
@@ -247,6 +249,84 @@ jobs:
           git config --global url."https://oauth2:${GITEE_TOKEN}@gitee.com/".insteadOf "https://gitee.com/"
           uv sync --python 3.13 --group test --frozen
           uv pip install -e sdk/python
+
+      - name: Provision NLTK data for unit tests
+        if: steps.detect_changes.outputs.has_python_changes == 'true'
+        run: |
+          set -euo pipefail
+
+          # The self-hosted runner stores NLTK packages as root-owned zip files.
+          # Reading them directly as the runner user fails with EACCES, while
+          # downloading replacements is blocked by the runner's SSRF policy.
+          # Copy the three required archives into the workspace with sudo, then
+          # unpack and validate them as the runner user.
+          NLTK_TARGET="${GITHUB_WORKSPACE}/nltk_data"
+          rm -rf "${NLTK_TARGET}"
+          mkdir -p "${NLTK_TARGET}/tokenizers" "${NLTK_TARGET}/corpora"
+
+          copy_nltk_archive() {
+            local relative_path="$1"
+            local source=""
+            for root in /usr/share/nltk_data /usr/local/share/nltk_data; do
+              if sudo test -f "${root}/${relative_path}"; then
+                source="${root}/${relative_path}"
+                break
+              fi
+            done
+            if [ -z "${source}" ]; then
+              echo "Missing required NLTK archive: ${relative_path}" >&2
+              return 1
+            fi
+            echo "Copying ${source}"
+            sudo cp "${source}" "${NLTK_TARGET}/${relative_path}"
+            sudo chown "$(id -u):$(id -g)" "${NLTK_TARGET}/${relative_path}"
+            chmod 0644 "${NLTK_TARGET}/${relative_path}"
+          }
+
+          copy_nltk_archive tokenizers/punkt_tab.zip
+          copy_nltk_archive tokenizers/punkt.zip
+          copy_nltk_archive corpora/wordnet.zip
+
+          NLTK_DATA="${NLTK_TARGET}" uv run python - <<'PYEOF'
+          import os
+          import zipfile
+
+          root = os.environ["NLTK_DATA"]
+          archives = (
+              ("tokenizers", "punkt_tab"),
+              ("tokenizers", "punkt"),
+              ("corpora", "wordnet"),
+          )
+          for category, package in archives:
+              archive = os.path.join(root, category, f"{package}.zip")
+              destination = os.path.join(root, category)
+              with zipfile.ZipFile(archive) as package_zip:
+                  bad_member = package_zip.testzip()
+                  if bad_member is not None:
+                      raise RuntimeError(f"Corrupt NLTK archive {archive}: {bad_member}")
+                  members = [name for name in package_zip.namelist() if not name.startswith("__MACOSX/")]
+                  prefix = f"{package}/"
+                  if not members or not all(name == package or name.startswith(prefix) for name in members):
+                      raise RuntimeError(f"Unexpected layout in {archive}: expected entries below {prefix}")
+                  package_zip.extractall(destination)
+              print(f"Unpacked {archive} -> {os.path.join(destination, package)}")
+          PYEOF
+
+          echo "NLTK_DATA=${NLTK_TARGET}" >> "${GITHUB_ENV}"
+
+          # Validate real tokenizer/lemmatizer calls, not only directory names.
+          # The command exits non-zero if any resource is absent or malformed.
+          NLTK_DATA="${NLTK_TARGET}" uv run python - <<'PYEOF'
+          import nltk
+          from nltk.corpus import wordnet
+          from nltk.tokenize import word_tokenize
+
+          for resource in ("tokenizers/punkt_tab", "tokenizers/punkt", "corpora/wordnet"):
+              print(f"[OK] {resource} -> {nltk.data.find(resource)}")
+          assert word_tokenize("NLTK data is ready.")
+          assert wordnet.synsets("document")
+          print("NLTK tokenizer and WordNet smoke checks passed")
+          PYEOF
 
       - name: Run unit test
         if: steps.detect_changes.outputs.has_python_changes == 'true'
@@ -272,7 +352,6 @@ jobs:
       API_PROXY_SCHEME: ${{ matrix.api_proxy_scheme }}
       RAGFLOW_IMAGE: infiniflow/ragflow:${{ github.run_id }}-infinity-${{ matrix.api_proxy_scheme }}
       HTTP_API_TEST_LEVEL: ${{ needs.ragflow_preflight.outputs.http_api_test_level }}
-      HAS_GO: ${{ needs.ragflow_preflight.outputs.has_go_changes }}
       HAS_PYTHON: ${{ needs.ragflow_preflight.outputs.has_python_changes }}
       HAS_WEB: ${{ needs.ragflow_preflight.outputs.has_web_changes }}
     steps:
@@ -291,114 +370,26 @@ jobs:
           fetch-tags: true
           allow-unsafe-pr-checkout: true
 
-      - name: Build ragflow go server
-        if: env.API_PROXY_SCHEME == 'go'
-        run: |
-          set -euo pipefail
-          BUILDER_CONTAINER=ragflow_build_${GITHUB_RUN_ID}_${DOC_ENGINE}_$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')
-          cleanup_builder() {
-            if [[ -n "${BUILDER_CONTAINER:-}" ]]; then
-              sudo docker rm -f -v "${BUILDER_CONTAINER}" >/dev/null 2>&1 || true
-            fi
-          }
-          trap cleanup_builder EXIT
-
-          TZ=${TZ:-$(readlink -f /etc/localtime | awk -F '/zoneinfo/' '{print $2}')}
-          sudo docker run --privileged -d --name "${BUILDER_CONTAINER}" \
-            -e TZ="${TZ}" \
-            -e UV_INDEX=https://mirrors.aliyun.com/pypi/simple \
-            -v "${PWD}:/ragflow" \
-            -v "${PWD}/internal/binding/cpp/resource:/usr/share/infinity/resource" \
-            infiniflow/infinity_builder:ubuntu22_clang20
-          sudo docker exec "${BUILDER_CONTAINER}" bash -c 'git config --global safe.directory "*" && cd /ragflow && ./build.sh --cpp'
-          ./build.sh --go
-
-      - name: Run Go unit tests
-        if: env.API_PROXY_SCHEME == 'go'
-        # Runs after `./build.sh --go`, which guarantees the C++ static
-        # library (librag_tokenizer_c_api.a) is present on disk. The Go
-        # test binaries link against it transitively through
-        # `internal/binding`, so running `go test` before the C++ build
-        # fails the link step.
-        #
-        # Excludes packages whose tests fail for environmental reasons
-        # unrelated to the diff:
-        #   - internal/tokenizer is split: the pure-Go BPE loader tests
-        #     (bpe_loader_test.go) run in the default tier; the C++ binding /
-        #     dict-dependent tests (tokenizer_test.go,
-        #     tokenizer_concurrent_test.go) and the on-disk anchor test
-        #     (bpe_loader_anchors_test.go) are tagged `manual` and need the
-        #     docker builder's /usr/share/infinity/resource, so they stay out
-        #     of the default run.
-        run: |
-          set -euo pipefail
-
-          # Provide the cl100k BPE table for the offline tokenizer loader.
-          # The loader reads <repo>/ragflow_deps/cl100k_base.tiktoken (or
-          # TIKTOKEN_CACHE_DIR). Try to fetch it directly from the upstream
-          # openai blob first (small ~1.6MB, reachable from the CI runner — the
-          # pre-PR code downloaded it on the fly, so the network path is known
-          # good). If the direct fetch fails (e.g. GFW), fall back to extracting
-          # it from the local infiniflow/ragflow_deps image *if already present*
-          # on the runner (no `docker pull`, since that huge image is first
-          # fetched at the later "Build ragflow:nightly" step). Best-effort: if
-          # neither source works, the loader still fails loudly (no silent
-          # 0-token degradation).
-          # tiktoken is already installed in runner
-          mkdir -p ragflow_deps
-          cp /opt/ragflow_deps/cl100k_base.tiktoken ragflow_deps/cl100k_base.tiktoken || true
-          if [ ! -f ragflow_deps/cl100k_base.tiktoken ]; then
-            mkdir -p ragflow_deps
-            if command -v curl >/dev/null 2>&1; then
-              if curl -fsSL -o ragflow_deps/cl100k_base.tiktoken \
-                https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken; then
-                echo "tiktoken: cl100k table fetched via curl from openai blob"
-              else
-                echo "tiktoken: curl fetch failed (network/GFW); will try cached image"
-              fi
-            fi
-            if [ ! -f ragflow_deps/cl100k_base.tiktoken ] && docker image inspect infiniflow/ragflow_deps:latest >/dev/null 2>&1; then
-              CID=$(docker create infiniflow/ragflow_deps:latest true) || true
-              if [ -n "${CID:-}" ]; then
-                if docker cp "$CID":/cl100k_base.tiktoken ragflow_deps/cl100k_base.tiktoken 2>/dev/null; then
-                  echo "tiktoken: cl100k table copied from cached infiniflow/ragflow_deps image"
-                fi
-                docker rm -f "$CID" >/dev/null 2>&1 || true
-              fi
-            fi
-          fi
-          if [ -f ragflow_deps/cl100k_base.tiktoken ]; then
-            echo "tiktoken: cl100k table provisioned ($(wc -c < ragflow_deps/cl100k_base.tiktoken) bytes)"
-          else
-            echo "tiktoken: cl100k table NOT provisioned — offline loader will fail loudly"
-          fi
-
-          PKGS=$(go list ./... 2>/dev/null \
-            | grep -v '/internal/storage$' \
-            | grep -v '/internal/handler$' || true)
-          if [ -z "$PKGS" ]; then
-            ./build.sh --test
-          else
-            ./build.sh --test -- $PKGS
-          fi
-
       - name: Build ragflow:nightly
         run: |
           set -euo pipefail
           RUNNER_WORKSPACE_PREFIX=${RUNNER_WORKSPACE_PREFIX:-${HOME}}
           BUILD_LOCK_FILE=${RUNNER_WORKSPACE_PREFIX}/artifacts/${GITHUB_REPOSITORY}/docker-build.lock
           mkdir -p "$(dirname "${BUILD_LOCK_FILE}")"
-          # Pass the Gitee personal access token to the Docker build as a BuildKit secret
-          # (mounted inside the builder at /run/secrets/gitee_token, never persisted in any layer).
-          GITEE_TOKEN_FILE="$(mktemp)"
-          printf '%s' '${GITEE_TOKEN}' > "${GITEE_TOKEN_FILE}"
+          # Pass the Gitee personal access token to the Docker build via --build-arg GITEE_TOKEN.
+          # Dockerfile_go / Dockerfile_ci read it from ARG GITEE_TOKEN (NOT a BuildKit secret),
+          # so the runner must expose GITEE_TOKEN as an environment variable (e.g. via the
+          # runner's docker-compose `environment:` mapping sourced from its .env file).
+          # Pick the Dockerfile matching the API proxy scheme:
+          #   - go  -> Dockerfile_go  (Go-native image)
+          #   - *   -> Dockerfile_ci  (Python/legacy image)
+          DOCKERFILE=Dockerfile_ci
           (
             flock -w 10800 9 || { echo "Timed out waiting for the shared Docker build slot" >&2; exit 1; }
-            echo "Acquired Docker build slot for ${DOC_ENGINE}/${API_PROXY_SCHEME}"
+            echo "Acquired Docker build slot for ${DOC_ENGINE}/${API_PROXY_SCHEME} (dockerfile=${DOCKERFILE})"
             ##sudo docker pull ubuntu:24.04
-            sudo DOCKER_BUILDKIT=1 docker build --build-arg NEED_MIRROR=1 --build-arg HTTPS_PROXY=${HTTPS_PROXY} --build-arg HTTP_PROXY=${HTTP_PROXY} --secret id=gitee_token,src=${GITEE_TOKEN_FILE} -f Dockerfile_ci -t ${RAGFLOW_IMAGE} .
+            sudo DOCKER_BUILDKIT=1 docker build --build-arg NEED_MIRROR=1 --build-arg HTTPS_PROXY=${HTTPS_PROXY} --build-arg HTTP_PROXY=${HTTP_PROXY} --build-arg GITEE_TOKEN=${GITEE_TOKEN} -f "${DOCKERFILE}" -t ${RAGFLOW_IMAGE} .
           ) 9>"${BUILD_LOCK_FILE}"
-          rm -f "${GITEE_TOKEN_FILE}"
 
       - name: Prepare Python test environment
         if: env.API_PROXY_SCHEME != 'web'
@@ -436,11 +427,19 @@ jobs:
           # Engine-specific offset partitions keep concurrent engine jobs from
           # choosing the same host ports when they land on the same self-hosted runner.
           # A lock plus reservation file closes the check/start race between parallel jobs.
-               PORT_BASES=(1200 1201 23817 23820 5432 5455 9000 9001 6379 6380 6601 9380 9381 9382 9384 9383 9385 80 443 4222 8222)
-               PARTITION_SIZE=6000
+               PORT_BASES=(1200 1201 23817 23820 5432 5455 9000 9001 6379 6380 6381 6601 9380 9381 9382 9384 9383 9385 80 443 4222 8222 9900 8123)
+               PARTITION_SIZE=3000
+               # Keep every (base + offset) host port BELOW the Linux ephemeral
+               # range (net.ipv4.ip_local_port_range, default 32768-60999). An
+               # outbound connection from the host can transiently squat on a port
+               # inside that range, and `docker compose up` then fails with
+               # "address already in use" even though the reservation succeeded —
+               # the reservation cannot see it because `docker ps` only lists
+               # container-published ports. Largest base is 23820, so offsets must
+               # stay under 8948 for the ceiling to clear 32768.
                case "${DOC_ENGINE}" in
-                 elasticsearch) PARTITION_BASE=1000 ;;
-                 infinity) PARTITION_BASE=31000 ;;
+                 elasticsearch) PARTITION_BASE=1000 ;;   # offsets 1000-3999 -> ports <= 27819
+                 infinity) PARTITION_BASE=4000 ;;        # offsets 4000-6999 -> ports <= 30819
                  *) echo "Unsupported DOC_ENGINE=${DOC_ENGINE}" >&2; exit 1 ;;
                esac
                # Runners run inside docker containers that share the host docker daemon
@@ -452,8 +451,8 @@ jobs:
                #     a docker network named ragflow-ci-port-<port> on the shared daemon. docker
                #     network create is NOT idempotent (fails on name conflict), so only one runner
                #     can claim a given port. This is per-PORT, not per-offset, because different
-               #     (base, offset) pairs can produce the same host port (e.g. 6380+36497 ==
-               #     9380+33497 == 42877); a per-offset guard cannot prevent that collision.
+               #     (base, offset) pairs can produce the same host port (e.g. 6380+5999 ==
+               #     9380+2999 == 12379); a per-offset guard cannot prevent that collision.
                #   - port availability = docker ps published ports (sees every container on the
                #     shared daemon regardless of which runner started it).
                # No file-system sharing required, no host netns required.
@@ -587,6 +586,7 @@ jobs:
                EXPOSE_NATS_PORT=$((4222 + PORT_OFFSET))
                NATS_MONITORING_PORT=$((8222 + PORT_OFFSET))
                TEI_PORT=$((6380 + PORT_OFFSET))
+               KVROCKS_PORT=$((6381 + PORT_OFFSET))
                KIBANA_PORT=$((6601 + PORT_OFFSET))
                SVR_HTTP_PORT=$((9380 + PORT_OFFSET))
                ADMIN_SVR_HTTP_PORT=$((9381 + PORT_OFFSET))
@@ -596,10 +596,20 @@ jobs:
                SANDBOX_EXECUTOR_MANAGER_PORT=$((9385 + PORT_OFFSET))
                SVR_WEB_HTTP_PORT=$((80 + PORT_OFFSET))
                SVR_WEB_HTTPS_PORT=$((443 + PORT_OFFSET))
+               EXPOSE_CLICKHOUSE_TCP_PORT=$((9900 + PORT_OFFSET))
+               CLICKHOUSE_HTTP_PORT=$((8123 + PORT_OFFSET))
 
           # Persist computed ports into .env so docker-compose uses the correct host bindings.
           # Remove previous CI overrides first; docker compose uses the last duplicate key.
-               sed -i '/^ES_PORT=/d;/^OS_PORT=/d;/^INFINITY_THRIFT_PORT=/d;/^INFINITY_HTTP_PORT=/d;/^INFINITY_PSQL_PORT=/d;/^EXPOSE_MYSQL_PORT=/d;/^MINIO_PORT=/d;/^MINIO_CONSOLE_PORT=/d;/^REDIS_PORT=/d;/^EXPOSE_NATS_PORT=/d;/^NATS_MONITORING_PORT=/d;/^TEI_PORT=/d;/^KIBANA_PORT=/d;/^SVR_HTTP_PORT=/d;/^ADMIN_SVR_HTTP_PORT=/d;/^SVR_MCP_PORT=/d;/^GO_HTTP_PORT=/d;/^GO_ADMIN_PORT=/d;/^SANDBOX_EXECUTOR_MANAGER_PORT=/d;/^SVR_WEB_HTTP_PORT=/d;/^SVR_WEB_HTTPS_PORT=/d;/^COMPOSE_PROFILES=/d;/^TEI_MODEL=/d;/^RAGFLOW_IMAGE=/d;/^DOC_ENGINE=/d;/^API_PROXY_SCHEME=/d' .env
+               sed -i '/^ES_PORT=/d;/^OS_PORT=/d;/^INFINITY_THRIFT_PORT=/d;/^INFINITY_HTTP_PORT=/d;/^INFINITY_PSQL_PORT=/d;/^EXPOSE_MYSQL_PORT=/d;/^MINIO_PORT=/d;/^MINIO_CONSOLE_PORT=/d;/^REDIS_PORT=/d;/^KVROCKS_PORT=/d;/^EXPOSE_NATS_PORT=/d;/^NATS_MONITORING_PORT=/d;/^TEI_PORT=/d;/^KIBANA_PORT=/d;/^SVR_HTTP_PORT=/d;/^ADMIN_SVR_HTTP_PORT=/d;/^SVR_MCP_PORT=/d;/^GO_HTTP_PORT=/d;/^GO_ADMIN_PORT=/d;/^SANDBOX_EXECUTOR_MANAGER_PORT=/d;/^SVR_WEB_HTTP_PORT=/d;/^SVR_WEB_HTTPS_PORT=/d;/^EXPOSE_CLICKHOUSE_TCP_PORT=/d;/^CLICKHOUSE_HTTP_PORT=/d;/^COMPOSE_PROFILES=/d;/^TEI_MODEL=/d;/^RAGFLOW_IMAGE=/d;/^DOC_ENGINE=/d;/^API_PROXY_SCHEME=/d' .env
+          # docker-compose-go.yml uses env_file: .env-go for the ragflow-cpu
+          # container, so the Go server process reads COMPOSE_PROFILES and
+          # TEI_MODEL from .env-go (not .env). Without syncing these two,
+          # the Go server's checkModelAvailable TEI bypass never triggers
+          # because .env-go's COMPOSE_PROFILES lacks "tei-", causing
+          # PATCH /models/default to fail for the Builtin/Local embedding
+          # model and datasets to be created with an empty embedding_model.
+               sed -i '/^COMPOSE_PROFILES=/d;/^RAGFLOW_DEV_MODE=/d;/^TEI_MODEL=/d' .env-go
                {
                  echo ""
                  echo "ES_PORT=${ES_PORT}"
@@ -611,6 +621,7 @@ jobs:
                  echo "MINIO_PORT=${MINIO_PORT}"
                  echo "MINIO_CONSOLE_PORT=${MINIO_CONSOLE_PORT}"
                  echo "REDIS_PORT=${REDIS_PORT}"
+                 echo "KVROCKS_PORT=${KVROCKS_PORT}"
                  echo "EXPOSE_NATS_PORT=${EXPOSE_NATS_PORT}"
                  echo "NATS_MONITORING_PORT=${NATS_MONITORING_PORT}"
                  echo "TEI_PORT=${TEI_PORT}"
@@ -623,17 +634,31 @@ jobs:
                  echo "SANDBOX_EXECUTOR_MANAGER_PORT=${SANDBOX_EXECUTOR_MANAGER_PORT}"
                  echo "SVR_WEB_HTTP_PORT=${SVR_WEB_HTTP_PORT}"
                  echo "SVR_WEB_HTTPS_PORT=${SVR_WEB_HTTPS_PORT}"
+                 echo "EXPOSE_CLICKHOUSE_TCP_PORT=${EXPOSE_CLICKHOUSE_TCP_PORT}"
+                 echo "CLICKHOUSE_HTTP_PORT=${CLICKHOUSE_HTTP_PORT}"
                  echo "COMPOSE_PROFILES=${DOC_ENGINE},cpu,ragflow-go,tei-cpu,deepdoc,metadata-mysql"
                  echo "TEI_MODEL=BAAI/bge-small-en-v1.5"
                  echo "RAGFLOW_IMAGE=${RAGFLOW_IMAGE}"
                  echo "DOC_ENGINE=${DOC_ENGINE}"
                  echo "API_PROXY_SCHEME=${API_PROXY_SCHEME}"
                } >> .env
-               if [[ "${API_PROXY_SCHEME}" == "go" ]]; then
-                 RAGFLOW_HTTP_PORT=${SVR_WEB_HTTP_PORT}
-               else
-                 RAGFLOW_HTTP_PORT=${SVR_HTTP_PORT}
-               fi
+          # Sync COMPOSE_PROFILES and TEI_MODEL into .env-go so the Go
+          # server container (env_file: .env-go) sees the same TEI bypass
+          # config as the Python container. Only these two affect the
+          # in-process checkModelAvailable logic; other .env keys are
+          # either yml-interpolation-only or already correct in .env-go.
+          # RAGFLOW_DEV_MODE rides along for the same reason.
+               {
+                 echo ""
+                 echo "COMPOSE_PROFILES=${DOC_ENGINE},cpu,ragflow-go,tei-cpu,deepdoc,metadata-mysql"
+                 echo "TEI_MODEL=BAAI/bge-small-en-v1.5"
+                 # The image stamps its git-describe output into /ragflow/VERSION,
+                 # so this checkout reports v0.27.x while --migrate records the
+                 # v1.0.0-rc1.dev1 database marker. Without the override the Go
+                 # server refuses to boot against the marker it just wrote.
+                 echo "RAGFLOW_DEV_MODE=true"
+               } >> .env-go
+               RAGFLOW_HTTP_PORT=${SVR_HTTP_PORT}
                echo "RAGFLOW_HTTP_PORT=${RAGFLOW_HTTP_PORT}" >> ${GITHUB_ENV}
                echo "HOST_ADDRESS=http://host.docker.internal:${RAGFLOW_HTTP_PORT}" >> ${GITHUB_ENV}
 
@@ -648,9 +673,10 @@ jobs:
 
       - name: Start ragflow:nightly for Infinity
         run: |
-          sudo docker compose -f docker/docker-compose.yml -p ${COMPOSE_PROJECT_NAME} down -v || true
+          COMPOSE_FILE=docker/docker-compose.yml
+          sudo docker compose -f "${COMPOSE_FILE}" -p ${COMPOSE_PROJECT_NAME} down -v || true
           sudo docker ps -a --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" -q | xargs -r sudo docker rm -f
-          sudo docker compose -f docker/docker-compose.yml -p ${COMPOSE_PROJECT_NAME} up -d
+          sudo docker compose -f "${COMPOSE_FILE}" -p ${COMPOSE_PROJECT_NAME} up -d
 
       - name: Run sdk tests against Infinity
         if: env.API_PROXY_SCHEME == 'python'
@@ -671,7 +697,7 @@ jobs:
             exit 1
           fi
           echo "Start to run test sdk on Infinity"
-          source .venv/bin/activate && set -o pipefail; DOC_ENGINE=infinity pytest -s --tb=short --level=${HTTP_API_TEST_LEVEL} --junitxml=pytest-infinity-sdk.xml --cov=sdk/python/ragflow_sdk --cov-branch --cov-report=xml:coverage-infinity-sdk.xml test/testcases/test_sdk_api 2>&1 | tee infinity_sdk_test.log
+          source .venv/bin/activate && set -o pipefail; DOC_ENGINE=infinity pytest -s --tb=short --level=${HTTP_API_TEST_LEVEL} --junitxml=pytest-infinity-sdk.xml --cov=sdk/python/ragflow_sdk --cov-branch --cov-report=xml:coverage-infinity-sdk.xml --durations=100 test/testcases/test_sdk_api 2>&1 | tee infinity_sdk_test.log
 
       - name: Run New RESTFUL api tests against Infinity
         if: env.API_PROXY_SCHEME != 'web'
@@ -691,7 +717,7 @@ jobs:
             sudo docker logs ${RAGFLOW_CONTAINER}
             exit 1
           fi
-          source .venv/bin/activate && set -o pipefail; DOC_ENGINE=infinity pytest -s --tb=short --level=${HTTP_API_TEST_LEVEL} test/testcases/restful_api 2>&1 | tee infinity_restful_api_test.log
+          source .venv/bin/activate && set -o pipefail; DOC_ENGINE=infinity pytest -s --tb=short --level=${HTTP_API_TEST_LEVEL} --durations=100 test/testcases/restful_api 2>&1 | tee infinity_restful_api_test.log
 
       - name: RAGFlow CLI retrieval test Infinity
         if: env.API_PROXY_SCHEME == 'python'
@@ -847,11 +873,24 @@ jobs:
 
       - name: Collect ragflow log Infinity
         if: ${{ !cancelled() }}
+        # Log collection is diagnostics only: rebuild the artifacts path here
+        # (the directory created by "Prepare function test environment" may be
+        # gone by now, which made `cp` fail with ENOENT) and never fail the job
+        # over a log copy error.
         run: |
+          set -uo pipefail
+          RUNNER_WORKSPACE_PREFIX="${RUNNER_WORKSPACE_PREFIX:-${HOME}}"
+          ARTIFACTS_DIR="${RUNNER_WORKSPACE_PREFIX}/artifacts/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${DOC_ENGINE}/${API_PROXY_SCHEME}"
+          LOG_DEST="${ARTIFACTS_DIR}/ragflow-logs-infinity"
+          mkdir -p "${ARTIFACTS_DIR}"
           if [ -d docker/ragflow-logs ]; then
-            destination="${ARTIFACTS_DIR}/ragflow-logs-infinity"
-            sudo cp -r docker/ragflow-logs "${destination}"
-            sudo chown -R "$(id -u):$(id -g)" "${destination}"
+            sudo rm -rf "${LOG_DEST}"
+            if sudo cp -a docker/ragflow-logs "${LOG_DEST}"; then
+              sudo chown -R "$(id -u):$(id -g)" "${LOG_DEST}" || true
+              echo "Copied ragflow logs to ${LOG_DEST}"
+            else
+              echo "::warning::Failed to copy ragflow logs to ${LOG_DEST}; continuing"
+            fi
             echo "ragflow log" && sudo tail -n 200 docker/ragflow-logs/ragflow_server.log || true
           else
             echo "No docker/ragflow-logs directory found; skipping log collection"
@@ -861,8 +900,9 @@ jobs:
       - name: Stop ragflow:nightly for Infinity
         if: ${{ always() }}
         run: |
+          COMPOSE_FILE=docker/docker-compose.yml
           # Sometimes `docker compose down` fail due to hang container, heavy load etc. Need to remove such containers to release resources(for example, listen ports).
-          sudo docker compose -f docker/docker-compose.yml -p ${COMPOSE_PROJECT_NAME} down -v || true
+          sudo docker compose -f "${COMPOSE_FILE}" -p ${COMPOSE_PROJECT_NAME} down -v || true
           sudo docker ps -a --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" -q | xargs -r sudo docker rm -f
           if [[ -n ${RAGFLOW_IMAGE} ]]; then
             sudo docker rmi -f ${RAGFLOW_IMAGE}
@@ -891,7 +931,6 @@ jobs:
       API_PROXY_SCHEME: ${{ matrix.api_proxy_scheme }}
       RAGFLOW_IMAGE: infiniflow/ragflow:${{ github.run_id }}-elasticsearch-${{ matrix.api_proxy_scheme }}
       HTTP_API_TEST_LEVEL: ${{ needs.ragflow_preflight.outputs.http_api_test_level }}
-      HAS_GO: ${{ needs.ragflow_preflight.outputs.has_go_changes }}
       HAS_PYTHON: ${{ needs.ragflow_preflight.outputs.has_python_changes }}
       HAS_WEB: ${{ needs.ragflow_preflight.outputs.has_web_changes }}
     steps:
@@ -910,114 +949,26 @@ jobs:
           fetch-tags: true
           allow-unsafe-pr-checkout: true
 
-      - name: Build ragflow go server
-        if: env.API_PROXY_SCHEME == 'go'
-        run: |
-          set -euo pipefail
-          BUILDER_CONTAINER=ragflow_build_${GITHUB_RUN_ID}_${DOC_ENGINE}_$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')
-          cleanup_builder() {
-            if [[ -n "${BUILDER_CONTAINER:-}" ]]; then
-              sudo docker rm -f -v "${BUILDER_CONTAINER}" >/dev/null 2>&1 || true
-            fi
-          }
-          trap cleanup_builder EXIT
-
-          TZ=${TZ:-$(readlink -f /etc/localtime | awk -F '/zoneinfo/' '{print $2}')}
-          sudo docker run --privileged -d --name "${BUILDER_CONTAINER}" \
-            -e TZ="${TZ}" \
-            -e UV_INDEX=https://mirrors.aliyun.com/pypi/simple \
-            -v "${PWD}:/ragflow" \
-            -v "${PWD}/internal/binding/cpp/resource:/usr/share/infinity/resource" \
-            infiniflow/infinity_builder:ubuntu22_clang20
-          sudo docker exec "${BUILDER_CONTAINER}" bash -c 'git config --global safe.directory "*" && cd /ragflow && ./build.sh --cpp'
-          ./build.sh --go
-
-      - name: Run Go unit tests
-        if: env.API_PROXY_SCHEME == 'go'
-        # Runs after `./build.sh --go`, which guarantees the C++ static
-        # library (librag_tokenizer_c_api.a) is present on disk. The Go
-        # test binaries link against it transitively through
-        # `internal/binding`, so running `go test` before the C++ build
-        # fails the link step.
-        #
-        # Excludes packages whose tests fail for environmental reasons
-        # unrelated to the diff:
-        #   - internal/tokenizer is split: the pure-Go BPE loader tests
-        #     (bpe_loader_test.go) run in the default tier; the C++ binding /
-        #     dict-dependent tests (tokenizer_test.go,
-        #     tokenizer_concurrent_test.go) and the on-disk anchor test
-        #     (bpe_loader_anchors_test.go) are tagged `manual` and need the
-        #     docker builder's /usr/share/infinity/resource, so they stay out
-        #     of the default run.
-        run: |
-          set -euo pipefail
-
-          # Provide the cl100k BPE table for the offline tokenizer loader.
-          # The loader reads <repo>/ragflow_deps/cl100k_base.tiktoken (or
-          # TIKTOKEN_CACHE_DIR). Try to fetch it directly from the upstream
-          # openai blob first (small ~1.6MB, reachable from the CI runner — the
-          # pre-PR code downloaded it on the fly, so the network path is known
-          # good). If the direct fetch fails (e.g. GFW), fall back to extracting
-          # it from the local infiniflow/ragflow_deps image *if already present*
-          # on the runner (no `docker pull`, since that huge image is first
-          # fetched at the later "Build ragflow:nightly" step). Best-effort: if
-          # neither source works, the loader still fails loudly (no silent
-          # 0-token degradation).
-          # tiktoken is already installed in runner
-          mkdir -p ragflow_deps
-          cp /opt/ragflow_deps/cl100k_base.tiktoken ragflow_deps/cl100k_base.tiktoken || true
-          if [ ! -f ragflow_deps/cl100k_base.tiktoken ]; then
-            mkdir -p ragflow_deps
-            if command -v curl >/dev/null 2>&1; then
-              if curl -fsSL -o ragflow_deps/cl100k_base.tiktoken \
-                https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken; then
-                echo "tiktoken: cl100k table fetched via curl from openai blob"
-              else
-                echo "tiktoken: curl fetch failed (network/GFW); will try cached image"
-              fi
-            fi
-            if [ ! -f ragflow_deps/cl100k_base.tiktoken ] && docker image inspect infiniflow/ragflow_deps:latest >/dev/null 2>&1; then
-              CID=$(docker create infiniflow/ragflow_deps:latest true) || true
-              if [ -n "${CID:-}" ]; then
-                if docker cp "$CID":/cl100k_base.tiktoken ragflow_deps/cl100k_base.tiktoken 2>/dev/null; then
-                  echo "tiktoken: cl100k table copied from cached infiniflow/ragflow_deps image"
-                fi
-                docker rm -f "$CID" >/dev/null 2>&1 || true
-              fi
-            fi
-          fi
-          if [ -f ragflow_deps/cl100k_base.tiktoken ]; then
-            echo "tiktoken: cl100k table provisioned ($(wc -c < ragflow_deps/cl100k_base.tiktoken) bytes)"
-          else
-            echo "tiktoken: cl100k table NOT provisioned — offline loader will fail loudly"
-          fi
-
-          PKGS=$(go list ./... 2>/dev/null \
-            | grep -v '/internal/storage$' \
-            | grep -v '/internal/handler$' || true)
-          if [ -z "$PKGS" ]; then
-            ./build.sh --test
-          else
-            ./build.sh --test -- $PKGS
-          fi
-
       - name: Build ragflow:nightly
         run: |
           set -euo pipefail
           RUNNER_WORKSPACE_PREFIX=${RUNNER_WORKSPACE_PREFIX:-${HOME}}
           BUILD_LOCK_FILE=${RUNNER_WORKSPACE_PREFIX}/artifacts/${GITHUB_REPOSITORY}/docker-build.lock
           mkdir -p "$(dirname "${BUILD_LOCK_FILE}")"
-          # Pass the Gitee personal access token to the Docker build as a BuildKit secret
-          # (mounted inside the builder at /run/secrets/gitee_token, never persisted in any layer).
-          GITEE_TOKEN_FILE="$(mktemp)"
-          printf '%s' '${GITEE_TOKEN }' > "${GITEE_TOKEN_FILE}"
+          # Pass the Gitee personal access token to the Docker build via --build-arg GITEE_TOKEN.
+          # Dockerfile_go / Dockerfile_ci read it from ARG GITEE_TOKEN (NOT a BuildKit secret),
+          # so the runner must expose GITEE_TOKEN as an environment variable (e.g. via the
+          # runner's docker-compose `environment:` mapping sourced from its .env file).
+          # Pick the Dockerfile matching the API proxy scheme:
+          #   - go  -> Dockerfile_go  (Go-native image)
+          #   - *   -> Dockerfile_ci  (Python/legacy image)
+          DOCKERFILE=Dockerfile_ci
           (
             flock -w 10800 9 || { echo "Timed out waiting for the shared Docker build slot" >&2; exit 1; }
-            echo "Acquired Docker build slot for ${DOC_ENGINE}/${API_PROXY_SCHEME}"
+            echo "Acquired Docker build slot for ${DOC_ENGINE}/${API_PROXY_SCHEME} (dockerfile=${DOCKERFILE})"
             ##sudo docker pull ubuntu:24.04
-            sudo DOCKER_BUILDKIT=1 docker build --build-arg NEED_MIRROR=1 --build-arg HTTPS_PROXY=${HTTPS_PROXY} --build-arg HTTP_PROXY=${HTTP_PROXY} --secret id=gitee_token,src=${GITEE_TOKEN_FILE} -f Dockerfile_ci -t ${RAGFLOW_IMAGE} .
+            sudo DOCKER_BUILDKIT=1 docker build --build-arg NEED_MIRROR=1 --build-arg HTTPS_PROXY=${HTTPS_PROXY} --build-arg HTTP_PROXY=${HTTP_PROXY} --build-arg GITEE_TOKEN=${GITEE_TOKEN} -f "${DOCKERFILE}" -t ${RAGFLOW_IMAGE} .
           ) 9>"${BUILD_LOCK_FILE}"
-          rm -f "${GITEE_TOKEN_FILE}"
 
       - name: Prepare Python test environment
         if: env.API_PROXY_SCHEME != 'web'
@@ -1055,11 +1006,19 @@ jobs:
           # Engine-specific offset partitions keep concurrent engine jobs from
           # choosing the same host ports when they land on the same self-hosted runner.
           # A lock plus reservation file closes the check/start race between parallel jobs.
-               PORT_BASES=(1200 1201 23817 23820 5432 5455 9000 9001 6379 6380 6601 9380 9381 9382 9384 9383 9385 80 443 4222 8222)
-               PARTITION_SIZE=6000
+               PORT_BASES=(1200 1201 23817 23820 5432 5455 9000 9001 6379 6380 6381 6601 9380 9381 9382 9384 9383 9385 80 443 4222 8222 9900 8123)
+               PARTITION_SIZE=3000
+               # Keep every (base + offset) host port BELOW the Linux ephemeral
+               # range (net.ipv4.ip_local_port_range, default 32768-60999). An
+               # outbound connection from the host can transiently squat on a port
+               # inside that range, and `docker compose up` then fails with
+               # "address already in use" even though the reservation succeeded —
+               # the reservation cannot see it because `docker ps` only lists
+               # container-published ports. Largest base is 23820, so offsets must
+               # stay under 8948 for the ceiling to clear 32768.
                case "${DOC_ENGINE}" in
-                 elasticsearch) PARTITION_BASE=1000 ;;
-                 infinity) PARTITION_BASE=31000 ;;
+                 elasticsearch) PARTITION_BASE=1000 ;;   # offsets 1000-3999 -> ports <= 27819
+                 infinity) PARTITION_BASE=4000 ;;        # offsets 4000-6999 -> ports <= 30819
                  *) echo "Unsupported DOC_ENGINE=${DOC_ENGINE}" >&2; exit 1 ;;
                esac
                # Runners run inside docker containers that share the host docker daemon
@@ -1071,8 +1030,8 @@ jobs:
                #     a docker network named ragflow-ci-port-<port> on the shared daemon. docker
                #     network create is NOT idempotent (fails on name conflict), so only one runner
                #     can claim a given port. This is per-PORT, not per-offset, because different
-               #     (base, offset) pairs can produce the same host port (e.g. 6380+36497 ==
-               #     9380+33497 == 42877); a per-offset guard cannot prevent that collision.
+               #     (base, offset) pairs can produce the same host port (e.g. 6380+5999 ==
+               #     9380+2999 == 12379); a per-offset guard cannot prevent that collision.
                #   - port availability = docker ps published ports (sees every container on the
                #     shared daemon regardless of which runner started it).
                # No file-system sharing required, no host netns required.
@@ -1206,6 +1165,7 @@ jobs:
                EXPOSE_NATS_PORT=$((4222 + PORT_OFFSET))
                NATS_MONITORING_PORT=$((8222 + PORT_OFFSET))
                TEI_PORT=$((6380 + PORT_OFFSET))
+               KVROCKS_PORT=$((6381 + PORT_OFFSET))
                KIBANA_PORT=$((6601 + PORT_OFFSET))
                SVR_HTTP_PORT=$((9380 + PORT_OFFSET))
                ADMIN_SVR_HTTP_PORT=$((9381 + PORT_OFFSET))
@@ -1215,10 +1175,20 @@ jobs:
                SANDBOX_EXECUTOR_MANAGER_PORT=$((9385 + PORT_OFFSET))
                SVR_WEB_HTTP_PORT=$((80 + PORT_OFFSET))
                SVR_WEB_HTTPS_PORT=$((443 + PORT_OFFSET))
+               EXPOSE_CLICKHOUSE_TCP_PORT=$((9900 + PORT_OFFSET))
+               CLICKHOUSE_HTTP_PORT=$((8123 + PORT_OFFSET))
 
           # Persist computed ports into .env so docker-compose uses the correct host bindings.
           # Remove previous CI overrides first; docker compose uses the last duplicate key.
-               sed -i '/^ES_PORT=/d;/^OS_PORT=/d;/^INFINITY_THRIFT_PORT=/d;/^INFINITY_HTTP_PORT=/d;/^INFINITY_PSQL_PORT=/d;/^EXPOSE_MYSQL_PORT=/d;/^MINIO_PORT=/d;/^MINIO_CONSOLE_PORT=/d;/^REDIS_PORT=/d;/^EXPOSE_NATS_PORT=/d;/^NATS_MONITORING_PORT=/d;/^TEI_PORT=/d;/^KIBANA_PORT=/d;/^SVR_HTTP_PORT=/d;/^ADMIN_SVR_HTTP_PORT=/d;/^SVR_MCP_PORT=/d;/^GO_HTTP_PORT=/d;/^GO_ADMIN_PORT=/d;/^SANDBOX_EXECUTOR_MANAGER_PORT=/d;/^SVR_WEB_HTTP_PORT=/d;/^SVR_WEB_HTTPS_PORT=/d;/^COMPOSE_PROFILES=/d;/^TEI_MODEL=/d;/^RAGFLOW_IMAGE=/d;/^DOC_ENGINE=/d;/^API_PROXY_SCHEME=/d' .env
+               sed -i '/^ES_PORT=/d;/^OS_PORT=/d;/^INFINITY_THRIFT_PORT=/d;/^INFINITY_HTTP_PORT=/d;/^INFINITY_PSQL_PORT=/d;/^EXPOSE_MYSQL_PORT=/d;/^MINIO_PORT=/d;/^MINIO_CONSOLE_PORT=/d;/^REDIS_PORT=/d;/^KVROCKS_PORT=/d;/^EXPOSE_NATS_PORT=/d;/^NATS_MONITORING_PORT=/d;/^TEI_PORT=/d;/^KIBANA_PORT=/d;/^SVR_HTTP_PORT=/d;/^ADMIN_SVR_HTTP_PORT=/d;/^SVR_MCP_PORT=/d;/^GO_HTTP_PORT=/d;/^GO_ADMIN_PORT=/d;/^SANDBOX_EXECUTOR_MANAGER_PORT=/d;/^SVR_WEB_HTTP_PORT=/d;/^SVR_WEB_HTTPS_PORT=/d;/^EXPOSE_CLICKHOUSE_TCP_PORT=/d;/^CLICKHOUSE_HTTP_PORT=/d;/^COMPOSE_PROFILES=/d;/^TEI_MODEL=/d;/^RAGFLOW_IMAGE=/d;/^DOC_ENGINE=/d;/^API_PROXY_SCHEME=/d' .env
+          # docker-compose-go.yml uses env_file: .env-go for the ragflow-cpu
+          # container, so the Go server process reads COMPOSE_PROFILES and
+          # TEI_MODEL from .env-go (not .env). Without syncing these two,
+          # the Go server's checkModelAvailable TEI bypass never triggers
+          # because .env-go's COMPOSE_PROFILES lacks "tei-", causing
+          # PATCH /models/default to fail for the Builtin/Local embedding
+          # model and datasets to be created with an empty embedding_model.
+               sed -i '/^COMPOSE_PROFILES=/d;/^RAGFLOW_DEV_MODE=/d;/^TEI_MODEL=/d' .env-go
                {
                  echo ""
                  echo "ES_PORT=${ES_PORT}"
@@ -1230,6 +1200,7 @@ jobs:
                  echo "MINIO_PORT=${MINIO_PORT}"
                  echo "MINIO_CONSOLE_PORT=${MINIO_CONSOLE_PORT}"
                  echo "REDIS_PORT=${REDIS_PORT}"
+                 echo "KVROCKS_PORT=${KVROCKS_PORT}"
                  echo "EXPOSE_NATS_PORT=${EXPOSE_NATS_PORT}"
                  echo "NATS_MONITORING_PORT=${NATS_MONITORING_PORT}"
                  echo "TEI_PORT=${TEI_PORT}"
@@ -1242,17 +1213,35 @@ jobs:
                  echo "SANDBOX_EXECUTOR_MANAGER_PORT=${SANDBOX_EXECUTOR_MANAGER_PORT}"
                  echo "SVR_WEB_HTTP_PORT=${SVR_WEB_HTTP_PORT}"
                  echo "SVR_WEB_HTTPS_PORT=${SVR_WEB_HTTPS_PORT}"
-                 echo "COMPOSE_PROFILES=${DOC_ENGINE},cpu,ragflow-go,tei-cpu,deepdoc,metadata-mysql"
+                 echo "EXPOSE_CLICKHOUSE_TCP_PORT=${EXPOSE_CLICKHOUSE_TCP_PORT}"
+                 echo "CLICKHOUSE_HTTP_PORT=${CLICKHOUSE_HTTP_PORT}"
+                 if [ "${API_PROXY_SCHEME}" = "go" ]; then
+                   echo "COMPOSE_PROFILES=${DOC_ENGINE},cpu,ragflow-go,tei-cpu,deepdoc,metadata-mysql,clickhouse"
+                 else
+                   echo "COMPOSE_PROFILES=${DOC_ENGINE},cpu,ragflow-go,tei-cpu,deepdoc,metadata-mysql"
+                 fi
                  echo "TEI_MODEL=BAAI/bge-small-en-v1.5"
                  echo "RAGFLOW_IMAGE=${RAGFLOW_IMAGE}"
                  echo "DOC_ENGINE=${DOC_ENGINE}"
                  echo "API_PROXY_SCHEME=${API_PROXY_SCHEME}"
                } >> .env
-               if [[ "${API_PROXY_SCHEME}" == "go" ]]; then
-                 RAGFLOW_HTTP_PORT=${SVR_WEB_HTTP_PORT}
-               else
-                 RAGFLOW_HTTP_PORT=${SVR_HTTP_PORT}
-               fi
+          # Sync COMPOSE_PROFILES and TEI_MODEL into .env-go so the Go
+          # server container (env_file: .env-go) sees the same TEI bypass
+          # config as the Python container. Only these two affect the
+          # in-process checkModelAvailable logic; other .env keys are
+          # either yml-interpolation-only or already correct in .env-go.
+          # RAGFLOW_DEV_MODE rides along for the same reason.
+               {
+                 echo ""
+                 echo "COMPOSE_PROFILES=${DOC_ENGINE},cpu,ragflow-go,tei-cpu,deepdoc,metadata-mysql"
+                 echo "TEI_MODEL=BAAI/bge-small-en-v1.5"
+                 # The image stamps its git-describe output into /ragflow/VERSION,
+                 # so this checkout reports v0.27.x while --migrate records the
+                 # v1.0.0-rc1.dev1 database marker. Without the override the Go
+                 # server refuses to boot against the marker it just wrote.
+                 echo "RAGFLOW_DEV_MODE=true"
+               } >> .env-go
+               RAGFLOW_HTTP_PORT=${SVR_HTTP_PORT}
                echo "RAGFLOW_HTTP_PORT=${RAGFLOW_HTTP_PORT}" >> ${GITHUB_ENV}
                echo "HOST_ADDRESS=http://host.docker.internal:${RAGFLOW_HTTP_PORT}" >> ${GITHUB_ENV}
 
@@ -1267,9 +1256,10 @@ jobs:
 
       - name: Start ragflow:nightly for Elasticsearch
         run: |
-          sudo docker compose -f docker/docker-compose.yml -p ${COMPOSE_PROJECT_NAME} down -v || true
+          COMPOSE_FILE=docker/docker-compose.yml
+          sudo docker compose -f "${COMPOSE_FILE}" -p ${COMPOSE_PROJECT_NAME} down -v || true
           sudo docker ps -a --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" -q | xargs -r sudo docker rm -f
-          sudo docker compose -f docker/docker-compose.yml -p ${COMPOSE_PROJECT_NAME} up -d
+          sudo docker compose -f "${COMPOSE_FILE}" -p ${COMPOSE_PROJECT_NAME} up -d
 
       - name: Run sdk tests against Elasticsearch
         if: env.API_PROXY_SCHEME == 'python'
@@ -1290,7 +1280,7 @@ jobs:
             exit 1
           fi
           echo "Start to run test sdk on Elasticsearch"
-          source .venv/bin/activate && set -o pipefail; pytest -s --tb=short --level=${HTTP_API_TEST_LEVEL} --junitxml=pytest-es-sdk.xml --cov=sdk/python/ragflow_sdk --cov-branch --cov-report=xml:coverage-es-sdk.xml test/testcases/test_sdk_api 2>&1 | tee es_sdk_test.log
+          source .venv/bin/activate && set -o pipefail; pytest -s --tb=short --level=${HTTP_API_TEST_LEVEL} --junitxml=pytest-es-sdk.xml --cov=sdk/python/ragflow_sdk --cov-branch --cov-report=xml:coverage-es-sdk.xml --durations=100 test/testcases/test_sdk_api 2>&1 | tee es_sdk_test.log
 
       - name: Run New RESTFUL api tests against Elasticsearch
         if: env.API_PROXY_SCHEME != 'web'
@@ -1310,7 +1300,7 @@ jobs:
             sudo docker logs ${RAGFLOW_CONTAINER}
             exit 1
           fi
-          source .venv/bin/activate && set -o pipefail; pytest -s --tb=short --level=${HTTP_API_TEST_LEVEL} test/testcases/restful_api 2>&1 | tee es_restful_api_test.log
+          source .venv/bin/activate && set -o pipefail; pytest -s --tb=short --level=${HTTP_API_TEST_LEVEL} --durations=100 test/testcases/restful_api 2>&1 | tee es_restful_api_test.log
 
       - name: RAGFlow CLI retrieval test Elasticsearch
         if: env.API_PROXY_SCHEME == 'python'
@@ -1461,11 +1451,23 @@ jobs:
 
       - name: Collect ragflow log Elasticsearch
         if: ${{ !cancelled() }}
+        # Keep this step self-sufficient: rebuild the artifacts path instead of
+        # relying on the directory created earlier, and downgrade copy failures
+        # to warnings so a diagnostics step can never fail the job.
         run: |
+          set -uo pipefail
+          RUNNER_WORKSPACE_PREFIX="${RUNNER_WORKSPACE_PREFIX:-${HOME}}"
+          ARTIFACTS_DIR="${RUNNER_WORKSPACE_PREFIX}/artifacts/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${DOC_ENGINE}/${API_PROXY_SCHEME}"
+          LOG_DEST="${ARTIFACTS_DIR}/ragflow-logs-es"
+          mkdir -p "${ARTIFACTS_DIR}"
           if [ -d docker/ragflow-logs ]; then
-            destination="${ARTIFACTS_DIR}/ragflow-logs-es"
-            sudo cp -r docker/ragflow-logs "${destination}"
-            sudo chown -R "$(id -u):$(id -g)" "${destination}"
+            sudo rm -rf "${LOG_DEST}"
+            if sudo cp -a docker/ragflow-logs "${LOG_DEST}"; then
+              sudo chown -R "$(id -u):$(id -g)" "${LOG_DEST}" || true
+              echo "Copied ragflow logs to ${LOG_DEST}"
+            else
+              echo "::warning::Failed to copy ragflow logs to ${LOG_DEST}; continuing"
+            fi
             echo "ragflow log" && sudo tail -n 200 docker/ragflow-logs/ragflow_server.log || true
           else
             echo "No docker/ragflow-logs directory found; skipping log collection"
@@ -1475,8 +1477,9 @@ jobs:
       - name: Stop ragflow:nightly for Elasticsearch
         if: ${{ always() }}
         run: |
+          COMPOSE_FILE=docker/docker-compose.yml
           # Sometimes `docker compose down` fail due to hang container, heavy load etc. Need to remove such containers to release resources(for example, listen ports).
-          sudo docker compose -f docker/docker-compose.yml -p ${COMPOSE_PROJECT_NAME} down -v || true
+          sudo docker compose -f "${COMPOSE_FILE}" -p ${COMPOSE_PROJECT_NAME} down -v || true
           sudo docker ps -a --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" -q | xargs -r sudo docker rm -f
           if [[ -n ${RAGFLOW_IMAGE} ]]; then
             sudo docker rmi -f ${RAGFLOW_IMAGE}
