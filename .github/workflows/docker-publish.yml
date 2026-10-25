@@ -3,7 +3,7 @@ name: Build and Publish Docker Image
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 concurrency:
   group: docker-publish-${{ github.ref }}
@@ -38,7 +38,8 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=ref,event=tag
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=match,pattern=^v(\d+\.\d+),group=1,prefix=v,priority=550
+            type=match,pattern=^v(\d+),group=1,prefix=v,priority=500
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
